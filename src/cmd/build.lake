@@ -1,0 +1,275 @@
+// Env-aware build dispatcher.  Iterates the manifest's `dep` lines,
+// installs anything missing in the cache, then assembles an envp
+// containing every dep's `<LIBNAME>_PATH` so the spawned `lakec`
+// resolves the dep's modules through lake-frontend's per-lib root
+// table (see lake-frontend/src/loader.rs `SearchPaths::from_env`).
+//
+// See docs/state/features/082_house_deps.md (lake-native-compiler)
+
++std.bytes.{ size addr at }
++std.process.{ alloc_or_die }
++std.strings.{ concat concat_buf }
++std.experimental.fs.{ cstr_of }
++std.experimental.process.{ run_envp }
++std.io.{ print println eprintln print_buf println_buf }
++manifest.{ dep_count dep_n_name dep_n_source dep_n_override }
++cache.{ lib_dir buf_concat }
++cmd.install.{ install_dep }
+
+@rt(rt_envp_raw)
+@rt(rt_load_ptr_raw)
+@rt(rt_store)
+@rt(rt_copy_bytes)
+
+const LAKE_STDLIB_PATH = "LAKE_PATH=/home/morphe/compiler/lake-stdlib"
+
+// Uppercase ASCII byte, mapping `-` and `.` to `_`.  Other bytes
+// pass through (we trust dep names to be lower-ascii + dot/dash;
+// any non-conforming byte is left as-is — frontend will reject
+// imports that fail its own ident rules).
+upper_byte is {
+  b i64 -> ret i64 {
+    when b == 45 {
+      true  -> { ret 95 }
+      false -> {
+        when b == 46 {
+          true  -> { ret 95 }
+          false -> {
+            when b >= 97 {
+              true -> {
+                when b <= 122 {
+                  true  -> { ret b - 32 }
+                  false -> { ret b }
+                }
+              }
+              false -> { ret b }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Fill `dst[off..off + size(name)]` with uppercased / sanitised
+// bytes from `name`.  Returns the post-fill offset.
+fill_upper is {
+  dst buf name buf n i64 i i64 off i64 -> ret i64 {
+    when i >= n {
+      true  -> { ret off }
+      false -> {
+        let b = at(name i)
+        let u = upper_byte(b)
+        rt_store(dst u 1 off)
+        self(dst name n i + 1 off + 1)
+      }
+    }
+  }
+}
+
+// Build the env entry string `<UP(name)>_PATH=<dir>\0` (NUL term).
+// Returns a fresh buf whose `addr()` is suitable for execve.
+build_env_entry is {
+  name buf dir buf -> ret buf {
+    let nn = size(name)
+    let dn = size(dir)
+    // layout: NAME(nn) + "_PATH="(6) + DIR(dn) + NUL(1)
+    let total = nn + 6 + dn + 1
+    let out = alloc_or_die(total)
+    let off1 = fill_upper(out name nn 0 0)
+    rt_store(out 95  1 off1)        // _
+    rt_store(out 80  1 off1 + 1)    // P
+    rt_store(out 65  1 off1 + 2)    // A
+    rt_store(out 84  1 off1 + 3)    // T
+    rt_store(out 72  1 off1 + 4)    // H
+    rt_store(out 61  1 off1 + 5)    // =
+    rt_copy_bytes(out off1 + 6 dir 0 dn)
+    rt_store(out 0 1 off1 + 6 + dn)
+    ret out
+  }
+}
+
+// Resolve a dep to its on-disk root: override path wins, else the
+// cache directory (`<HOME>/.lake/libs/<name>/<ref-or-ver>`).  For
+// git sources we strip the `git+url#` prefix to get the ref.
+resolve_dep_dir is {
+  name buf source buf override buf -> ret buf {
+    let on = size(override)
+    when on > 0 {
+      true  -> { ret override }
+      false -> {
+        let ver = ref_or_version(source)
+        ret lib_dir(name ver)
+      }
+    }
+  }
+}
+
+// For `git+url#ref` return `ref`; otherwise return the source
+// verbatim (treated as a semver version string).
+ref_or_version is {
+  source buf -> ret buf {
+    let n = size(source)
+    when n < 4 {
+      true  -> { ret source }
+      false -> {
+        let b0 = at(source 0)
+        let b1 = at(source 1)
+        let b2 = at(source 2)
+        let b3 = at(source 3)
+        when b0 == 103 {
+          true -> {
+            when b1 == 105 {
+              true -> {
+                when b2 == 116 {
+                  true -> {
+                    when b3 == 43 {
+                      true  -> { ret git_ref_only(source n 4) }
+                      false -> { ret source }
+                    }
+                  }
+                  false -> { ret source }
+                }
+              }
+              false -> { ret source }
+            }
+          }
+          false -> { ret source }
+        }
+      }
+    }
+  }
+}
+
+// Walk `source[start..n]` looking for `#`, return the bytes after
+// it as a fresh buf.  Falls back to the full tail if no `#`.
+git_ref_only is {
+  source buf n i64 start i64 -> ret buf {
+    let hash = find_hash(source n start)
+    when hash < 0 {
+      true  -> { ret slice_to(source start n) }
+      false -> { ret slice_to(source hash + 1 n) }
+    }
+  }
+}
+
+find_hash is {
+  src buf n i64 i i64 -> ret i64 {
+    when i >= n {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let c = at(src i)
+        when c == 35 {
+          true  -> { ret i }
+          false -> { self(src n i + 1) }
+        }
+      }
+    }
+  }
+}
+
+slice_to is {
+  src buf lo i64 hi i64 -> ret buf {
+    let n = hi - lo
+    let out = alloc_or_die(n)
+    rt_copy_bytes(out 0 src lo n)
+    ret out
+  }
+}
+
+// Count existing envp entries (terminator excluded).
+count_envp is {
+  base i64 i i64 -> ret i64 {
+    let p = rt_load_ptr_raw(base i)
+    when p == 0 {
+      true  -> { ret i }
+      false -> { self(base i + 1) }
+    }
+  }
+}
+
+// Copy existing envp pointers into `dst[0..n]`.
+copy_env_ptrs is {
+  dst buf base i64 i i64 n i64 -> ret i64 {
+    when i >= n {
+      true  -> { ret 0 }
+      false -> {
+        let p = rt_load_ptr_raw(base i)
+        rt_store(dst p 8 i * 8)
+        self(dst base i + 1 n)
+      }
+    }
+  }
+}
+
+// Iterate deps, install missing ones, and accumulate their env
+// entries into `slots[off..]`.  Returns the post-fill offset.
+//
+// State carried: `(file flen ndeps i slots off)`.
+fill_dep_env is {
+  file buf flen i64 ndeps i64 i i64 slots buf off i64 -> ret i64 {
+    when i >= ndeps {
+      true  -> { ret off }
+      false -> {
+        let name = dep_n_name(file flen i)
+        let source = dep_n_source(file flen i)
+        let override = dep_n_override(file flen i)
+        let ov_size = size(override)
+        when ov_size == 0 {
+          true  -> { pin install_dep(name source) }
+          false -> { }
+        }
+        let dir = resolve_dep_dir(name source override)
+        let entry = build_env_entry(name dir)
+        rt_store(slots addr(entry) 8 off)
+        self(file flen ndeps i + 1 slots off + 8)
+      }
+    }
+  }
+}
+
+// Assemble final envp:  existing envp pointers ++ dep env entries
+// ++ LAKE_PATH override ++ NUL.  Returns the envp buf so the
+// caller can pass `addr(envp_buf)` to `run_envp`.
+pub build_envp is {
+  file buf flen i64 ndeps i64 -> ret buf {
+    let base = rt_envp_raw()
+    let existing = count_envp(base 0)
+    // total slots: existing + ndeps + 1 (LAKE_PATH) + 1 (NUL)
+    let total_slots = existing + ndeps + 2
+    let envp = alloc_or_die(total_slots * 8)
+    pin copy_env_ptrs(envp base 0 existing)
+    let post_dep = fill_dep_env(file flen ndeps 0 envp existing * 8)
+    let lake_cstr = cstr_of(concat("" "LAKE_PATH=/home/morphe/compiler/lake-stdlib"))
+    rt_store(envp addr(lake_cstr) 8 post_dep)
+    rt_store(envp 0 8 post_dep + 8)
+    ret envp
+  }
+}
+
+// Entry point used by `cmd_build` / `cmd_run` in main.lake.
+pub spawn_lakec is {
+  entry buf file buf flen i64 ndeps i64 -> ret i64 {
+    let envp = build_envp(file flen ndeps)
+    let lakec = concat("" "/home/morphe/compiler/lake-native-compiler/target/release/lakec")
+    let r = run_envp(lakec entry addr(envp))
+    when r.0 {
+      :ok -> {
+        when r.1 {
+          0 -> {
+            println("[build] ok")
+            ret 0
+          }
+          _ -> {
+            eprintln("[build] lakec exited non-zero")
+            ret r.1
+          }
+        }
+      }
+      _ -> {
+        eprintln("[build] failed to spawn lakec")
+        ret 1
+      }
+    }
+  }
+}

@@ -11,7 +11,8 @@
 +std.bytes.{ size }
 +std.experimental.fs.{ mkdir create close_file write_str MODE_755 MODE_644 }
 +std.experimental.process.{ run }
-+manifest.{ load parse_entry }
++manifest.{ load parse_entry dep_count }
++cmd.build.{ spawn_lakec }
 
 // ── help ────────────────────────────────────────────────────────
 
@@ -105,60 +106,30 @@ cmd_new is {
   }
 }
 
-// Invoke `lakec <entry>` and report the exit code.  Hard-coded
-// path for now — Phase 5 resolves it from a `[tool.lakec]` block
-// in the manifest or a fallback `LAKEC` env var.  Lake's `const`
-// keyword currently only types as i64 (see #C1–#C6), so we
-// materialise the path with an inline `concat` instead.
-build_entry is {
-  entry buf -> ret i64 {
-    let lakec = concat("" "/home/morphe/compiler/lake-native-compiler/target/release/lakec")
-    let r = run(lakec entry)
-    when r.0 {
-      :ok -> {
-        when r.1 {
-          0 -> {
-            println("[build] ok")
-            ret 0
-          }
-          _ -> {
-            eprintln("[build] lakec exited non-zero")
-            ret r.1
-          }
-        }
-      }
-      _ -> {
-        eprintln("[build] failed to spawn lakec")
-        ret 1
-      }
-    }
-  }
-}
-
-read_entry is {
-  _pad i64 -> ret buf {
+// Load + parse the manifest, install missing deps, and dispatch
+// `lakec <entry>` with an envp carrying each dep's `<LIBNAME>_PATH`
+// plus a `LAKE_PATH` override.  Returns lakec's exit code (0 on
+// success, errno-shaped int otherwise).
+build_with_deps is {
+  _pad i64 -> ret i64 {
     let path = concat("" "lake.house")
     let m = load(path)
-    let entry = parse_entry(m size(m))
-    ret entry
+    let mlen = size(m)
+    let entry = parse_entry(m mlen)
+    let ndeps = dep_count(m mlen)
+    print("[build] compiling ")
+    println_buf(entry)
+    ret spawn_lakec(entry m mlen ndeps)
   }
 }
 
 cmd_build is {
-  _ -> {
-    let entry = read_entry(0)
-    print("[build] compiling ")
-    println_buf(entry)
-    pin build_entry(entry)
-  }
+  _ -> { pin build_with_deps(0) }
 }
 
 cmd_run is {
   _ -> {
-    let entry = read_entry(0)
-    print("[run] compiling ")
-    println_buf(entry)
-    let code = build_entry(entry)
+    let code = build_with_deps(0)
     when code {
       0 -> {
         let bin = concat("" "src/build/main")

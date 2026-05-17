@@ -13,6 +13,7 @@
 +std.experimental.process.{ run }
 +manifest.{ load parse_entry dep_count }
 +cmd.build.{ spawn_lakec }
++cmd.publish.{ publish_current }
 
 // ── help ────────────────────────────────────────────────────────
 
@@ -24,6 +25,7 @@ usage is {
     println("  house new <name>   scaffold a new project")
     println("  house build        build via lakec")
     println("  house run          build + execute")
+    println("  house publish      append current pkg to registry")
     println("  house help         show this message")
   }
 }
@@ -157,10 +159,11 @@ cmd_run is {
 dispatch_cmd is {
   cmd buf -> {
     when cmd {
-      "help"  -> { usage() }
-      "build" -> { cmd_build() }
-      "run"   -> { cmd_run() }
-      "new"   -> { dispatch_new() }
+      "help"    -> { usage() }
+      "build"   -> { cmd_build() }
+      "run"     -> { cmd_run() }
+      "new"     -> { dispatch_new() }
+      "publish" -> { pin publish_current(0) }
       _ -> {
         eprintln("house: unknown command")
         usage()

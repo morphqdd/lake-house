@@ -1,0 +1,5 @@
++std.io.{ println }
+
+main is {
+  _ -> { println("hello, lake!") }
+}

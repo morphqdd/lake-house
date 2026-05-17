@@ -1,0 +1,164 @@
+// Lake-flavoured project manifest parser.
+//
+// Format (line-based, whitespace-delimited, quoted strings allowed):
+//
+//     project "myapp" "0.1.0"
+//     entry   "src/main.lake"
+//     dep     "lake-rails" "0.1.0"
+//
+// Phase 3 only extracts the `entry "<path>"` value — enough for
+// the build/run dispatchers in Phase 4.  project/version/deps
+// land in later phases when there are consumers.
+
++std.experimental.fs.{ open close read }
++std.experimental.sys.{ O_RDONLY }
++std.process.{ alloc_or_die die }
++std.bytes.{ at trim }
++std.io.{ eprintln print }
+
+@rt(rt_copy_bytes)
+
+const MAX_MANIFEST = 4096
+
+pub load is {
+  path buf -> ret buf {
+    let or = open(path O_RDONLY 0)
+    when or.0 {
+      :ok -> {
+        let fd = or.1
+        let payload = alloc_or_die(MAX_MANIFEST)
+        let rr = read(fd payload MAX_MANIFEST)
+        when rr.0 {
+          :ok -> {
+            let n = rr.1
+            let _tp = trim(payload n)
+            close(fd)
+            ret payload
+          }
+          _ -> {
+            eprintln("house: read failed")
+            die()
+            ret payload
+          }
+        }
+      }
+      _ -> {
+        eprintln("house: lake.house not found")
+        die()
+        ret path
+      }
+    }
+  }
+}
+
+// FSM that walks the manifest body looking for `entry "<path>"`.
+// All state lives in the machine's arguments so the parser is a
+// single ret-machine; no helper ret-machines to chain.
+//
+// State `s`:
+//   0..4 — matching e n t r y    (ASCII 101 110 116 114 121)
+//   5    — past 'entry', skipping until opening `"`
+//   6    — between quotes, collecting payload until closing `"`
+// `q` is the index of the first payload byte (state-5 → state-6).
+//
+// Returns packed `q * MAX_MANIFEST + length` on success, -1 on
+// EOF before the pattern is found.  The payload bytes are at
+// `file[q .. q + length]`.
+scan_entry is {
+  f buf flen i64 i i64 s i64 q i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let b = at(f i)
+        let ni = i + 1
+        when s == 6 {
+          true -> {
+            when b == 34 {
+              true  -> { ret q * MAX_MANIFEST + i - q }
+              false -> { self(f flen ni 6 q) }
+            }
+          }
+          false -> {
+            when s == 5 {
+              true -> {
+                when b == 34 {
+                  true  -> { self(f flen ni 6 ni) }
+                  false -> { self(f flen ni 5 q) }
+                }
+              }
+              false -> {
+                when s == 0 {
+                  true -> {
+                    when b == 101 {
+                      true  -> { self(f flen ni 1 q) }
+                      false -> { self(f flen ni 0 q) }
+                    }
+                  }
+                  false -> {
+                    when s == 1 {
+                      true -> {
+                        when b == 110 {
+                          true  -> { self(f flen ni 2 q) }
+                          false -> { self(f flen ni 0 q) }
+                        }
+                      }
+                      false -> {
+                        when s == 2 {
+                          true -> {
+                            when b == 116 {
+                              true  -> { self(f flen ni 3 q) }
+                              false -> { self(f flen ni 0 q) }
+                            }
+                          }
+                          false -> {
+                            when s == 3 {
+                              true -> {
+                                when b == 114 {
+                                  true  -> { self(f flen ni 4 q) }
+                                  false -> { self(f flen ni 0 q) }
+                                }
+                              }
+                              false -> {
+                                when b == 121 {
+                                  true  -> { self(f flen ni 5 q) }
+                                  false -> { self(f flen ni 0 q) }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// `parse_entry(file, flen)` extracts the entry-path bytes and
+// returns a fresh, trimmed buf.  Dies on any parse failure.
+pub parse_entry is {
+  file buf flen i64 -> ret buf {
+    let packed = scan_entry(file flen 0 0 0)
+    when packed < 0 {
+      true -> {
+        eprintln("house: lake.house: missing 'entry' line")
+        die()
+        ret file
+      }
+      false -> {
+        let q = packed / MAX_MANIFEST
+        let n = packed - q * MAX_MANIFEST
+        let out = alloc_or_die(n)
+        rt_copy_bytes(out 0 file q n)
+        let _t = trim(out n)
+        ret out
+      }
+    }
+  }
+}

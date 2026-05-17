@@ -1,0 +1,238 @@
+// lake-house — Lake's project & build CLI, written in Lake itself.
+//
+// Phase 2: argv dispatch only.  Implementations of `new` / `build`
+// / `run` land in their own modules under `src/cmd/*.lake` over the
+// following phases.
+
++std.env.{ argc argv_at }
++std.io.{ print println eprintln print_buf println_buf }
++std.sys.{ exit }
++std.strings.{ concat concat_buf }
++std.bytes.{ size }
++std.experimental.fs.{ mkdir create close write_str MODE_755 MODE_644 }
++std.experimental.process.{ run }
++manifest.{ load parse_entry }
+
+// ── help ────────────────────────────────────────────────────────
+
+usage is {
+  _ -> {
+    println("house — Lake project tool")
+    println("")
+    println("usage:")
+    println("  house new <name>   scaffold a new project")
+    println("  house build        build via lakec")
+    println("  house run          build + execute")
+    println("  house help         show this message")
+  }
+}
+
+// ── command stubs ───────────────────────────────────────────────
+//
+// Each stub prints the planned behaviour and returns; the real
+// logic lands in Phase 3 (manifest parsing) and Phase 4 (build /
+// run dispatch via `std.experimental.process.run`).
+
+// Scaffolded `lake.house` and `src/main.lake` contents — kept as
+// str literals so they're embedded in the binary's rodata.  When
+// the user customises the templates the diff stays in this file.
+
+const TEMPLATE_HOUSE = "project \"app\" \"0.1.0\"\nentry \"src/main.lake\"\n"
+
+const TEMPLATE_MAIN = "+std.io.{ println }\n\nmain is {\n  _ -> { println(\"hello, lake!\") }\n}\n"
+
+// Write `content` to `path`, killing the actor on any kernel
+// failure (the only sensible response for a one-shot scaffold).
+//
+// Returns `ret i64` so callers can sequence with `pin` — without
+// the explicit ret-type these calls would async-spawn and `write`
+// might race ahead of its parent `mkdir`.
+write_file is {
+  path buf content str -> ret i64 {
+    let r = create(path MODE_644)
+    when r.0 {
+      :ok -> {
+        let fd = r.1
+        let _w = write_str(fd content)
+        let _c = close(fd)
+        ret 0
+      }
+      _ -> {
+        eprintln("house new: could not create file")
+        pin exit(1)
+        ret 1
+      }
+    }
+  }
+}
+
+// `mkdir`, treating EEXIST (errno 17) as success.  Lets `house
+// new` survive when the user re-runs it against an existing tree.
+// Same ret-typed shape as `write_file` for sequencing.
+mkdir_p is {
+  path buf -> ret i64 {
+    let r = mkdir(path MODE_755)
+    when r.0 {
+      :ok -> { ret 0 }
+      :err -> {
+        when r.1 {
+          17 -> { ret 0 }
+          _ -> {
+            eprintln("house new: mkdir failed")
+            pin exit(1)
+            ret 1
+          }
+        }
+      }
+    }
+  }
+}
+
+cmd_new is {
+  name buf -> {
+    print("[new] scaffolding ")
+    println_buf(name)
+    pin mkdir_p(name)
+    let src_dir = concat_buf(name "/src")
+    pin mkdir_p(src_dir)
+    let house_path = concat_buf(name "/lake.house")
+    pin write_file(house_path TEMPLATE_HOUSE)
+    let main_path = concat_buf(src_dir "/main.lake")
+    pin write_file(main_path TEMPLATE_MAIN)
+    print("[new] done — try: cd ")
+    print_buf(name)
+    println(" && house build")
+  }
+}
+
+// Invoke `lakec <entry>` and report the exit code.  Hard-coded
+// path for now — Phase 5 resolves it from a `[tool.lakec]` block
+// in the manifest or a fallback `LAKEC` env var.  Lake's `const`
+// keyword currently only types as i64 (see #C1–#C6), so we
+// materialise the path with an inline `concat` instead.
+build_entry is {
+  entry buf -> ret i64 {
+    let lakec = concat("" "/home/morphe/compiler/lake-native-compiler/target/release/lakec")
+    let r = run(lakec entry)
+    when r.0 {
+      :ok -> {
+        when r.1 {
+          0 -> {
+            println("[build] ok")
+            ret 0
+          }
+          _ -> {
+            eprintln("[build] lakec exited non-zero")
+            ret r.1
+          }
+        }
+      }
+      _ -> {
+        eprintln("[build] failed to spawn lakec")
+        ret 1
+      }
+    }
+  }
+}
+
+read_entry is {
+  _pad i64 -> ret buf {
+    let path = concat("" "lake.house")
+    let m = load(path)
+    let entry = parse_entry(m size(m))
+    ret entry
+  }
+}
+
+cmd_build is {
+  _ -> {
+    let entry = read_entry(0)
+    print("[build] compiling ")
+    println_buf(entry)
+    pin build_entry(entry)
+  }
+}
+
+cmd_run is {
+  _ -> {
+    let entry = read_entry(0)
+    print("[run] compiling ")
+    println_buf(entry)
+    let code = build_entry(entry)
+    when code {
+      0 -> {
+        let bin = concat("" "src/build/main")
+        print("[run] executing ")
+        println_buf(bin)
+        let empty = concat("" "")
+        let rr = run(bin empty)
+        when rr.0 {
+          :ok -> { }
+          _   -> { eprintln("[run] failed to spawn binary") }
+        }
+      }
+      _ -> { }
+    }
+  }
+}
+
+// ── argv dispatch ───────────────────────────────────────────────
+
+// Match the argv-derived `cmd` buf against the known command set
+// and dispatch to the matching stub.  Lake's `when` over a buf
+// reuses the MPHF-based string pattern dispatch (see #8), so
+// matching against compile-time literals is O(1) and incurs no
+// allocation.
+dispatch_cmd is {
+  cmd buf -> {
+    when cmd {
+      "help"  -> { usage() }
+      "build" -> { cmd_build() }
+      "run"   -> { cmd_run() }
+      "new"   -> { dispatch_new() }
+      _ -> {
+        eprintln("house: unknown command")
+        usage()
+        pin exit(2)
+      }
+    }
+  }
+}
+
+dispatch_new is {
+  _ -> {
+    let n = argc()
+    when n >= 3 {
+      true  -> {
+        let r = argv_at(2)
+        when r.0 {
+          :ok -> { cmd_new(r.1) }
+          _   -> {
+            eprintln("house new: missing <name>")
+            pin exit(2)
+          }
+        }
+      }
+      false -> {
+        eprintln("house new: missing <name>")
+        pin exit(2)
+      }
+    }
+  }
+}
+
+main is {
+  _ -> {
+    let n = argc()
+    when n >= 2 {
+      true -> {
+        let r = argv_at(1)
+        when r.0 {
+          :ok -> { dispatch_cmd(r.1) }
+          _   -> { usage() }
+        }
+      }
+      false -> { usage() }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+# Build artifacts
+src/build/
+**/build/
+house
+myapp/src/build/
+examples/*/src/build/

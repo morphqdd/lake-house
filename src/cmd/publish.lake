@@ -19,6 +19,7 @@
 +cache.{ index_dir buf_concat update_index is_installed }
 +registry.{ pick_registry_url }
 +cmd.git_capture.{ git_origin_url git_head_ref }
++cmd.gh_pr.{ is_github_url gh_owner gh_repo gh_user can_admin direct_push_opt_in fork_dir gh_fork ensure_fork_clone gh_checkout_branch gh_add_commit gh_push_branch write_pr_body gh_pr_create print_manual_pr_runbook }
 
 @rt(rt_copy_bytes)
 @rt(rt_store)
@@ -514,13 +515,13 @@ publish_with_name_ver is {
         eprintln("[publish] could not refresh registry index")
         ret 0 - 1
       }
-      false -> { ret publish_after_index(name version) }
+      false -> { ret publish_after_index(name version reg_url) }
     }
   }
 }
 
 publish_after_index is {
-  name buf version buf -> ret i64 {
+  name buf version buf reg_url buf -> ret i64 {
     let origin = git_origin_url()
     let on = size(origin)
     when on == 0 {
@@ -528,13 +529,13 @@ publish_after_index is {
         eprintln("[publish] could not read remote.origin.url — run inside a git repo with origin set")
         ret 0 - 1
       }
-      false -> { ret publish_with_origin(name version origin) }
+      false -> { ret publish_with_origin(name version origin reg_url) }
     }
   }
 }
 
 publish_with_origin is {
-  name buf version buf origin buf -> ret i64 {
+  name buf version buf origin buf reg_url buf -> ret i64 {
     let ref = git_head_ref()
     let rn = size(ref)
     when rn == 0 {
@@ -542,12 +543,48 @@ publish_with_origin is {
         eprintln("[publish] could not determine HEAD ref")
         ret 0 - 1
       }
-      false -> { ret publish_write_entry(name version origin ref) }
+      false -> { ret route_publish(name version origin ref reg_url) }
     }
   }
 }
 
-publish_write_entry is {
+// Decide between direct-push (owner + opt-in) and fork+PR (default).
+// Non-github registry URLs fall through to the direct path with a
+// warning since gh CLI only knows github.com.
+route_publish is {
+  name buf version buf origin buf ref buf reg_url buf -> ret i64 {
+    let gh = is_github_url(reg_url)
+    when gh == 0 {
+      true -> {
+        eprintln("[publish] registry URL is not github.com — using direct push")
+        ret publish_direct(name version origin ref)
+      }
+      false -> {
+        let owner = gh_owner(reg_url)
+        let repo = gh_repo(reg_url)
+        let admin = can_admin(owner repo)
+        let opt = direct_push_opt_in()
+        when admin == 1 {
+          true -> {
+            when opt == 1 {
+              true -> {
+                println("[publish] owner + LAKE_HOUSE_DIRECT_PUSH=1 — direct push")
+                ret publish_direct(name version origin ref)
+              }
+              false -> { ret publish_pr(name version origin ref owner repo) }
+            }
+          }
+          false -> { ret publish_pr(name version origin ref owner repo) }
+        }
+      }
+    }
+  }
+}
+
+// Direct-push path — writes into the canonical `~/.lake/index/`
+// checkout (which `update_index` already refreshed) and uses the
+// pre-existing git-add/commit/push helpers.
+publish_direct is {
   name buf version buf origin buf ref buf -> ret i64 {
     let dir = shard_dir(name)
     pin mkdir_p(dir)
@@ -590,6 +627,207 @@ publish_write_entry is {
         }
       }
     }
+  }
+}
+
+// Fork+PR path.  Resolves the user login first; bails to the manual
+// runbook if any gh/git invocation fails.
+publish_pr is {
+  name buf version buf origin buf ref buf owner buf repo buf -> ret i64 {
+    let user = gh_user()
+    let un = size(user)
+    when un == 0 {
+      true  -> {
+        eprintln("[publish] gh api user failed — is gh authenticated? (gh auth login)")
+        ret 0 - 1
+      }
+      false -> { ret publish_pr_with_user(name version origin ref owner repo user) }
+    }
+  }
+}
+
+publish_pr_with_user is {
+  name buf version buf origin buf ref buf owner buf repo buf user buf -> ret i64 {
+    print("[publish] fork-and-PR as ")
+    println_buf(user)
+    let rf = gh_fork(owner repo)
+    when rf {
+      0 -> { ret publish_pr_after_fork(name version origin ref owner repo user) }
+      _ -> {
+        eprintln("[publish] gh repo fork failed")
+        let branch = make_branch(name version)
+        let dir = fork_dir(user)
+        pin print_manual_pr_runbook(owner repo user branch name version dir)
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+publish_pr_after_fork is {
+  name buf version buf origin buf ref buf owner buf repo buf user buf -> ret i64 {
+    let dir = fork_dir(user)
+    let rc = ensure_fork_clone(user owner repo dir)
+    when rc {
+      0 -> { ret publish_pr_after_clone(name version origin ref owner repo user dir) }
+      _ -> {
+        eprintln("[publish] could not prepare fork checkout")
+        let branch = make_branch(name version)
+        pin print_manual_pr_runbook(owner repo user branch name version dir)
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+publish_pr_after_clone is {
+  name buf version buf origin buf ref buf owner buf repo buf user buf dir buf -> ret i64 {
+    let branch = make_branch(name version)
+    let rc = gh_checkout_branch(dir branch)
+    when rc {
+      0 -> { ret publish_pr_after_branch(name version origin ref owner repo user dir branch) }
+      _ -> {
+        eprintln("[publish] git checkout failed")
+        pin print_manual_pr_runbook(owner repo user branch name version dir)
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+publish_pr_after_branch is {
+  name buf version buf origin buf ref buf owner buf repo buf user buf dir buf branch buf -> ret i64 {
+    let relpath = fork_relpath(name)
+    let abs = buf_concat(buf_concat(dir concat("" "/")) relpath)
+    let existing = read_all(abs)
+    let exn = size(existing)
+    let vline = build_version_line(version origin ref)
+    pin mkdir_p(buf_concat(dir fork_shard_subdir(name)))
+    print("[publish] fork manifest ")
+    println_buf(abs)
+    when exn == 0 {
+      true -> {
+        let w = write_new_pkg(abs name vline)
+        when w < 0 {
+          true  -> { ret 0 - 1 }
+          false -> { ret publish_pr_commit(name version owner repo user dir branch relpath origin ref) }
+        }
+      }
+      false -> {
+        let dup = has_version(existing exn version size(version))
+        when dup == 1 {
+          true  -> {
+            print("house: ")
+            print_buf(name)
+            print(" ")
+            print_buf(version)
+            println(" already in fork — pushing branch anyway for re-PR")
+            ret publish_pr_commit(name version owner repo user dir branch relpath origin ref)
+          }
+          false -> {
+            let w = append_version(abs existing exn vline)
+            when w < 0 {
+              true  -> { ret 0 - 1 }
+              false -> { ret publish_pr_commit(name version owner repo user dir branch relpath origin ref) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+publish_pr_commit is {
+  name buf version buf owner buf repo buf user buf dir buf branch buf relpath buf origin buf ref buf -> ret i64 {
+    let rc = gh_add_commit(dir relpath name version)
+    when rc {
+      0 -> { ret publish_pr_push(name version owner repo user dir branch origin ref) }
+      _ -> {
+        eprintln("[publish] git add/commit in fork failed")
+        pin print_manual_pr_runbook(owner repo user branch name version dir)
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+publish_pr_push is {
+  name buf version buf owner buf repo buf user buf dir buf branch buf origin buf ref buf -> ret i64 {
+    let rc = gh_push_branch(dir branch)
+    when rc {
+      0 -> { ret publish_pr_open(name version owner repo user branch origin ref) }
+      _ -> {
+        eprintln("[publish] git push to fork failed")
+        pin print_manual_pr_runbook(owner repo user branch name version dir)
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+publish_pr_open is {
+  name buf version buf owner buf repo buf user buf branch buf origin buf ref buf -> ret i64 {
+    let body = write_pr_body(name version origin ref)
+    let rc = gh_pr_create(owner repo user branch name version body)
+    when rc {
+      0 -> {
+        print("[publish] PR opened against ")
+        print_buf(owner)
+        print("/")
+        print_buf(repo)
+        print(" (head ")
+        print_buf(user)
+        print(":")
+        print_buf(branch)
+        println(")")
+        ret 0
+      }
+      _ -> {
+        eprintln("[publish] gh pr create failed")
+        let dir = fork_dir(user)
+        pin print_manual_pr_runbook(owner repo user branch name version dir)
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+// `publish/<name>-<version>`.
+make_branch is {
+  name buf version buf -> ret buf {
+    let p1 = concat("" "publish/")
+    let p2 = buf_concat(p1 name)
+    let p3 = concat_buf(p2 "-")
+    let p4 = buf_concat(p3 version)
+    ret p4
+  }
+}
+
+// `packages/<f>/<name>.lake` — relative to the fork dir.
+fork_relpath is {
+  name buf -> ret buf {
+    let first = at(name 0)
+    let sh = shard_byte(first)
+    let s = alloc_or_die(1)
+    rt_store(s sh 1 0)
+    let p1 = concat("" "packages/")
+    let p2 = buf_concat(p1 s)
+    let p3 = concat_buf(p2 "/")
+    let p4 = buf_concat(p3 name)
+    let p5 = concat_buf(p4 ".lake")
+    ret p5
+  }
+}
+
+// `/packages/<f>` shard subdir under the fork dir (for mkdir).
+fork_shard_subdir is {
+  name buf -> ret buf {
+    let first = at(name 0)
+    let sh = shard_byte(first)
+    let s = alloc_or_die(1)
+    rt_store(s sh 1 0)
+    let p1 = concat("" "/packages/")
+    ret buf_concat(p1 s)
   }
 }
 

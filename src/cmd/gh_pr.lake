@@ -1,0 +1,486 @@
+// `house publish` fork-and-PR path via the `gh` CLI.  Owners may
+// still opt into direct push with `LAKE_HOUSE_DIRECT_PUSH=1`.
+//
+// Steps:
+//   1. parse registry URL -> (owner, repo) for `gh` arguments,
+//   2. capture `gh api user --jq .login` for the fork remote owner,
+//   3. `gh repo fork <owner>/<repo> --clone=false` (idempotent),
+//   4. clone (or hard-refresh) the fork into ~/.lake/index-fork-<user>/,
+//   5. branch `publish/<name>-<ver>`, edit packages/<f>/<name>.lake,
+//   6. commit + push to fork (force-with-lease for re-runs),
+//   7. `gh pr create --repo <owner>/<repo> --base master
+//        --head <user>:<branch> --title "..." --body-file /tmp/...`.
+
++std.bytes.{ size at }
++std.process.{ alloc_or_die }
++std.strings.{ concat concat_buf }
++std.experimental.fs.{ open close_file create write write_str MODE_644 }
++std.experimental.sys.{ O_RDONLY }
++std.experimental.process.{ run3 }
++std.io.{ print println eprintln print_buf println_buf }
++cache.{ buf_concat home_dir is_installed getenv_buf }
++cmd.git_capture.{ tmp_path git_capture_to_file read_file_trimmed }
+
+@rt(rt_copy_bytes)
+@rt(rt_store)
+
+// ── URL parsing ──────────────────────────────────────────────
+//
+// Recognise `https://github.com/<owner>/<repo>(.git)?`.  Returns
+// 1 on success, 0 if not github.com.  On success, `out_owner` and
+// `out_repo` are written via callback-style: we expose two parsers
+// `gh_owner(url)` and `gh_repo(url)` and `is_github_url(url)`.
+
+// Byte-by-byte prefix check against the literal "https://github.com/".
+// We carry the prefix in a `str` and read its bytes via cstr_of so
+// `at(...)` works the same as for url payload bytes.
+prefix_match is {
+  url buf un i64 pre buf plen i64 i i64 -> ret i64 {
+    when un < plen {
+      true  -> { ret 0 }
+      false -> {
+        when i >= plen {
+          true  -> { ret 1 }
+          false -> {
+            let a = at(url i)
+            let b = at(pre i)
+            when a == b {
+              true  -> { self(url un pre plen i + 1) }
+              false -> { ret 0 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+prefix_buf is {
+  _ -> ret buf {
+    ret concat("" "https://github.com/")
+  }
+}
+
+pub is_github_url is {
+  url buf -> ret i64 {
+    let un = size(url)
+    let pre = prefix_buf()
+    let plen = size(pre)
+    ret prefix_match(url un pre plen 0)
+  }
+}
+
+// Find next `/` starting at `from`.  Returns -1 if none.
+find_slash is {
+  url buf un i64 i i64 -> ret i64 {
+    when i >= un {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let b = at(url i)
+        when b == 47 {
+          true  -> { ret i }
+          false -> { self(url un i + 1) }
+        }
+      }
+    }
+  }
+}
+
+// Slice `url[lo..hi]` into a fresh buf.
+slice_to is {
+  src buf lo i64 hi i64 -> ret buf {
+    let n = hi - lo
+    let out = alloc_or_die(n)
+    rt_copy_bytes(out 0 src lo n)
+    ret out
+  }
+}
+
+// strip trailing ".git" if present.
+strip_dot_git is {
+  s buf -> ret buf {
+    let n = size(s)
+    when n < 4 {
+      true  -> { ret s }
+      false -> {
+        let b0 = at(s n - 4)
+        let b1 = at(s n - 3)
+        let b2 = at(s n - 2)
+        let b3 = at(s n - 1)
+        when b0 == 46 {
+          true -> {
+            when b1 == 103 {
+              true -> {
+                when b2 == 105 {
+                  true -> {
+                    when b3 == 116 {
+                      true  -> { ret slice_to(s 0 n - 4) }
+                      false -> { ret s }
+                    }
+                  }
+                  false -> { ret s }
+                }
+              }
+              false -> { ret s }
+            }
+          }
+          false -> { ret s }
+        }
+      }
+    }
+  }
+}
+
+// `gh_owner(url)` — bytes between the prefix and the next `/`.
+pub gh_owner is {
+  url buf -> ret buf {
+    let un = size(url)
+    let pre = prefix_buf()
+    let plen = size(pre)
+    let m = prefix_match(url un pre plen 0)
+    when m == 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let slash = find_slash(url un plen)
+        when slash < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> { ret slice_to(url plen slash) }
+        }
+      }
+    }
+  }
+}
+
+// `gh_repo(url)` — bytes between the owner-slash and end (minus .git).
+pub gh_repo is {
+  url buf -> ret buf {
+    let un = size(url)
+    let pre = prefix_buf()
+    let plen = size(pre)
+    let m = prefix_match(url un pre plen 0)
+    when m == 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let slash = find_slash(url un plen)
+        when slash < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> {
+            let raw = slice_to(url slash + 1 un)
+            ret strip_dot_git(raw)
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── gh API helpers ──────────────────────────────────────────
+
+// `gh_user()` — capture `gh api user --jq .login`.  Empty buf on fail.
+pub gh_user is {
+  _ -> ret buf {
+    let stem = concat("" "ghuser")
+    let out = tmp_path(stem)
+    let cmd = concat("" "gh api user --jq .login")
+    let rc = git_capture_to_file(cmd out)
+    when rc {
+      0 -> { ret read_file_trimmed(out) }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// `can_admin(owner repo)` — capture
+// `gh repo view <owner>/<repo> --json viewerCanAdminister --jq .viewerCanAdminister`.
+// Returns 1 if stdout is the byte string "true", else 0.
+pub can_admin is {
+  owner buf repo buf -> ret i64 {
+    let stem = concat("" "ghadm")
+    let out = tmp_path(stem)
+    let p1 = concat("" "gh repo view ")
+    let p2 = buf_concat(p1 owner)
+    let p3 = concat_buf(p2 "/")
+    let p4 = buf_concat(p3 repo)
+    let p5 = concat_buf(p4 " --json viewerCanAdminister --jq .viewerCanAdminister")
+    let rc = git_capture_to_file(p5 out)
+    when rc {
+      0 -> {
+        let s = read_file_trimmed(out)
+        let n = size(s)
+        when n == 4 {
+          true -> {
+            let b0 = at(s 0)
+            let b1 = at(s 1)
+            let b2 = at(s 2)
+            let b3 = at(s 3)
+            when b0 == 116 {
+              true -> {
+                when b1 == 114 {
+                  true -> {
+                    when b2 == 117 {
+                      true -> {
+                        when b3 == 101 {
+                          true  -> { ret 1 }
+                          false -> { ret 0 }
+                        }
+                      }
+                      false -> { ret 0 }
+                    }
+                  }
+                  false -> { ret 0 }
+                }
+              }
+              false -> { ret 0 }
+            }
+          }
+          false -> { ret 0 }
+        }
+      }
+      _ -> { ret 0 }
+    }
+  }
+}
+
+// `direct_push_opt_in()` — 1 iff env LAKE_HOUSE_DIRECT_PUSH=1.
+pub direct_push_opt_in is {
+  _ -> ret i64 {
+    let name = concat("" "LAKE_HOUSE_DIRECT_PUSH")
+    let v = getenv_buf(name)
+    let n = size(v)
+    when n < 1 {
+      true  -> { ret 0 }
+      false -> {
+        let b = at(v 0)
+        when b == 49 {
+          true  -> { ret 1 }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// ── fork checkout dir ────────────────────────────────────────
+
+// `fork_dir(user)` — `<HOME>/.lake/index-fork-<user>/`.
+pub fork_dir is {
+  user buf -> ret buf {
+    let h = home_dir()
+    let p1 = concat_buf(h "/.lake/index-fork-")
+    let p2 = buf_concat(p1 user)
+    ret p2
+  }
+}
+
+// Run a shell command, ignoring stdout (uses parent stdio).
+sh_run is {
+  cmd buf -> ret i64 {
+    let sh = concat("" "/bin/sh")
+    let dashc = concat("" "-c")
+    let r = run3(sh dashc cmd)
+    when r.0 {
+      :ok -> { ret r.1 }
+      _   -> { ret 0 - 1 }
+    }
+  }
+}
+
+pub run_sh is {
+  cmd buf -> ret i64 {
+    ret sh_run(cmd)
+  }
+}
+
+// `gh_fork(owner repo)` — `gh repo fork <owner>/<repo> --clone=false`.
+// Idempotent: gh treats an existing fork as success.
+pub gh_fork is {
+  owner buf repo buf -> ret i64 {
+    let p1 = concat("" "gh repo fork ")
+    let p2 = buf_concat(p1 owner)
+    let p3 = concat_buf(p2 "/")
+    let p4 = buf_concat(p3 repo)
+    let p5 = concat_buf(p4 " --clone=false")
+    print("[publish] ")
+    println_buf(p5)
+    ret sh_run(p5)
+  }
+}
+
+// `ensure_fork_clone(user owner repo dir)` — clone fork into `dir` if
+// missing, else `git -C <dir> fetch && git -C <dir> reset --hard
+// origin/master`.
+pub ensure_fork_clone is {
+  user buf owner buf repo buf dir buf -> ret i64 {
+    let cached = is_installed(dir)
+    when cached == 1 {
+      true  -> { ret refresh_fork(dir) }
+      false -> { ret clone_fork(user repo dir) }
+    }
+  }
+}
+
+clone_fork is {
+  user buf repo buf dir buf -> ret i64 {
+    let p1 = concat("" "git clone https://github.com/")
+    let p2 = buf_concat(p1 user)
+    let p3 = concat_buf(p2 "/")
+    let p4 = buf_concat(p3 repo)
+    let p5 = concat_buf(p4 ".git ")
+    let p6 = buf_concat(p5 dir)
+    print("[publish] cloning fork into ")
+    println_buf(dir)
+    ret sh_run(p6)
+  }
+}
+
+refresh_fork is {
+  dir buf -> ret i64 {
+    let p1 = concat("" "git -C ")
+    let p2 = buf_concat(p1 dir)
+    let p3 = concat_buf(p2 " fetch --quiet origin && git -C ")
+    let p4 = buf_concat(p3 dir)
+    let p5 = concat_buf(p4 " reset --hard --quiet origin/master")
+    print("[publish] refreshing fork at ")
+    println_buf(dir)
+    ret sh_run(p5)
+  }
+}
+
+// `gh_checkout_branch(dir branch)` — `git -C <dir> checkout -B <branch>`.
+pub gh_checkout_branch is {
+  dir buf branch buf -> ret i64 {
+    let p1 = concat("" "git -C ")
+    let p2 = buf_concat(p1 dir)
+    let p3 = concat_buf(p2 " checkout -B ")
+    let p4 = buf_concat(p3 branch)
+    ret sh_run(p4)
+  }
+}
+
+// `gh_add_commit(dir relpath name version)` — stage one path and
+// commit with message `publish: <name> <v>`.
+pub gh_add_commit is {
+  dir buf relpath buf name buf version buf -> ret i64 {
+    let p1 = concat("" "git -C ")
+    let p2 = buf_concat(p1 dir)
+    let p3 = concat_buf(p2 " add ")
+    let p4 = buf_concat(p3 relpath)
+    let r1 = sh_run(p4)
+    when r1 {
+      0 -> {
+        let m1 = concat("" "git -C ")
+        let m2 = buf_concat(m1 dir)
+        let m3 = concat_buf(m2 " commit -m \"publish: ")
+        let m4 = buf_concat(m3 name)
+        let m5 = concat_buf(m4 " ")
+        let m6 = buf_concat(m5 version)
+        let m7 = concat_buf(m6 "\"")
+        ret sh_run(m7)
+      }
+      _ -> { ret 0 - 1 }
+    }
+  }
+}
+
+// `gh_push_branch(dir branch)` — push (with force-with-lease so a
+// re-run of `house publish` against an existing branch updates it).
+pub gh_push_branch is {
+  dir buf branch buf -> ret i64 {
+    let p1 = concat("" "git -C ")
+    let p2 = buf_concat(p1 dir)
+    let p3 = concat_buf(p2 " push --force-with-lease -u origin ")
+    let p4 = buf_concat(p3 branch)
+    ret sh_run(p4)
+  }
+}
+
+// Write the PR body to `/tmp/lake-house-pr-body-<pid>`.  Returns the
+// path on success, empty buf on failure.
+pub write_pr_body is {
+  name buf version buf url buf ref buf -> ret buf {
+    let stem = concat("" "pr-body")
+    let path = tmp_path(stem)
+    let r = create(path MODE_644)
+    when r.0 {
+      :ok -> {
+        let fd = r.1
+        let _w1 = write_str(fd "publish: ")
+        let _w2 = write(fd name size(name))
+        let _w3 = write_str(fd " ")
+        let _w4 = write(fd version size(version))
+        let _w5 = write_str(fd "\n\n- url: ")
+        let _w6 = write(fd url size(url))
+        let _w7 = write_str(fd "\n- ref: ")
+        let _w8 = write(fd ref size(ref))
+        let _w9 = write_str(fd "\n")
+        close_file(fd)
+        ret path
+      }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// `gh_pr_create(owner repo user branch name version body_path)` —
+// `gh pr create --repo <owner>/<repo> --base master --head <user>:<branch> ...`.
+pub gh_pr_create is {
+  owner buf repo buf user buf branch buf name buf version buf body_path buf -> ret i64 {
+    let p1 = concat("" "gh pr create --repo ")
+    let p2 = buf_concat(p1 owner)
+    let p3 = concat_buf(p2 "/")
+    let p4 = buf_concat(p3 repo)
+    let p5 = concat_buf(p4 " --base master --head ")
+    let p6 = buf_concat(p5 user)
+    let p7 = concat_buf(p6 ":")
+    let p8 = buf_concat(p7 branch)
+    let p9 = concat_buf(p8 " --title \"publish: ")
+    let p10 = buf_concat(p9 name)
+    let p11 = concat_buf(p10 " ")
+    let p12 = buf_concat(p11 version)
+    let p13 = concat_buf(p12 "\" --body-file ")
+    let p14 = buf_concat(p13 body_path)
+    print("[publish] ")
+    println_buf(p14)
+    ret sh_run(p14)
+  }
+}
+
+// `print_manual_pr_runbook` — printed when any gh/git step fails so
+// the user can finish the PR by hand.
+pub print_manual_pr_runbook is {
+  owner buf repo buf user buf branch buf name buf version buf dir buf -> ret i64 {
+    println("[publish] fork+PR step failed — manual recovery:")
+    print("  gh repo fork ")
+    print_buf(owner)
+    print("/")
+    print_buf(repo)
+    println(" --clone=false")
+    print("  git clone https://github.com/")
+    print_buf(user)
+    print("/")
+    print_buf(repo)
+    print(".git ")
+    println_buf(dir)
+    print("  cd ")
+    println_buf(dir)
+    print("  git checkout -B ")
+    println_buf(branch)
+    println("  # edit packages/<f>/<name>.lake, append the version line")
+    print("  git add packages && git commit -m \"publish: ")
+    print_buf(name)
+    print(" ")
+    print_buf(version)
+    println("\"")
+    print("  git push --force-with-lease -u origin ")
+    println_buf(branch)
+    print("  gh pr create --repo ")
+    print_buf(owner)
+    print("/")
+    print_buf(repo)
+    print(" --base master --head ")
+    print_buf(user)
+    print(":")
+    println_buf(branch)
+    ret 0
+  }
+}

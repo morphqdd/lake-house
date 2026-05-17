@@ -14,6 +14,7 @@
 +manifest.{ load parse_entry dep_count }
 +cmd.build.{ spawn_lakec }
 +cmd.publish.{ publish_current }
++cmd.add.{ add_dep }
 
 // ── help ────────────────────────────────────────────────────────
 
@@ -26,6 +27,7 @@ usage is {
     println("  house build        build via lakec")
     println("  house run          build + execute")
     println("  house publish      append current pkg to registry")
+    println("  house add <pkg> <ver>  resolve + pin a registry dep")
     println("  house help         show this message")
   }
 }
@@ -164,9 +166,41 @@ dispatch_cmd is {
       "run"     -> { cmd_run() }
       "new"     -> { dispatch_new() }
       "publish" -> { pin publish_current(0) }
+      "add"     -> { dispatch_add() }
       _ -> {
         eprintln("house: unknown command")
         usage()
+        pin exit(2)
+      }
+    }
+  }
+}
+
+dispatch_add is {
+  _ -> {
+    let n = argc()
+    when n >= 4 {
+      true -> {
+        let rname = argv_at(2)
+        when rname.0 {
+          :ok -> {
+            let rver = argv_at(3)
+            when rver.0 {
+              :ok -> { pin add_dep(rname.1 rver.1) }
+              _   -> {
+                eprintln("house add: missing <ver>")
+                pin exit(2)
+              }
+            }
+          }
+          _ -> {
+            eprintln("house add: missing <pkg>")
+            pin exit(2)
+          }
+        }
+      }
+      false -> {
+        eprintln("house add: usage: house add <pkg> <ver>")
         pin exit(2)
       }
     }

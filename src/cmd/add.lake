@@ -1,0 +1,689 @@
+// `house add <pkg> <ver>` — resolve a registry package, append the
+// dep to `lake.house`, clone into cache, refresh `lake.lock`.
+//
+// Steps:
+//   1. refresh registry index (clone or pull),
+//   2. read `packages/<f>/<pkg>.lake`, find matching `version "<v>"`,
+//   3. append `dep "<pkg>" "<ver>"` to current cwd `lake.house`,
+//   4. clone via the version line's `git`/`rev` into the lib cache,
+//   5. capture HEAD sha,
+//   6. rewrite `lake.lock` with the new dep line (and existing ones).
+
++std.bytes.{ size at }
++std.process.{ alloc_or_die }
++std.strings.{ concat concat_buf }
++std.experimental.fs.{ open close_file read create write write_str MODE_644 }
++std.experimental.sys.{ O_RDONLY }
++std.experimental.process.{ run3 }
++std.io.{ print println eprintln print_buf println_buf }
++manifest.{ load parse_project_name parse_project_version manifest_registry_url dep_count dep_n_name dep_n_source dep_n_kind DEP_BARE }
++cache.{ index_dir lib_dir buf_concat update_index is_installed }
++registry.{ pick_registry_url }
++cmd.lock.{ load_lock build_dep_line build_lock_body write_lock lock_url lock_ref lock_sha }
++cmd.lock_sync.{ head_sha }
+
+@rt(rt_copy_bytes)
+@rt(rt_store)
+
+const MAX_PKG = 8192
+
+// First letter, lower-cased; non-letter -> `_`.
+shard_byte is {
+  b i64 -> ret i64 {
+    when b >= 65 {
+      true -> {
+        when b <= 90 {
+          true  -> { ret b + 32 }
+          false -> {
+            when b >= 97 {
+              true -> {
+                when b <= 122 {
+                  true  -> { ret b }
+                  false -> { ret 95 }
+                }
+              }
+              false -> { ret 95 }
+            }
+          }
+        }
+      }
+      false -> { ret 95 }
+    }
+  }
+}
+
+// `<index>/packages/<f>/<name>.lake`.
+shard_path is {
+  name buf -> ret buf {
+    let idx = index_dir()
+    let nn = size(name)
+    when nn < 1 {
+      true  -> { ret idx }
+      false -> {
+        let first = at(name 0)
+        let sh = shard_byte(first)
+        let s = alloc_or_die(1)
+        rt_store(s sh 1 0)
+        let p1 = concat_buf(idx "/packages/")
+        let p2 = buf_concat(p1 s)
+        let p3 = concat_buf(p2 "/")
+        let p4 = buf_concat(p3 name)
+        let p5 = concat_buf(p4 ".lake")
+        ret p5
+      }
+    }
+  }
+}
+
+// Read a file entirely (cap MAX_PKG).  Empty buf if missing.
+read_all is {
+  path buf -> ret buf {
+    let or = open(path O_RDONLY 0)
+    when or.0 {
+      :ok -> {
+        let fd = or.1
+        let payload = alloc_or_die(MAX_PKG)
+        let rr = read(fd payload MAX_PKG)
+        close_file(fd)
+        when rr.0 {
+          :ok -> { ret payload }
+          _ -> { ret alloc_or_die(0) }
+        }
+      }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// ── pkg manifest tokeniser (mirrors registry.lake) ────────────
+
+pkg_next_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret flen }
+      false -> {
+        let b = at(f i)
+        let ni = i + 1
+        when b == 10 {
+          true  -> { ret ni }
+          false -> { self(f flen ni) }
+        }
+      }
+    }
+  }
+}
+
+pkg_skip_ws is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret i }
+      false -> {
+        let b = at(f i)
+        when b == 32 {
+          true  -> { self(f flen i + 1) }
+          false -> {
+            when b == 9 {
+              true  -> { self(f flen i + 1) }
+              false -> { ret i }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pkg_scan_quoted is {
+  f buf flen i64 start i64 j i64 -> ret i64 {
+    when j >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let b = at(f j)
+        when b == 34 {
+          true -> {
+            let q = start + 1
+            ret q * MAX_PKG + j - q
+          }
+          false -> { self(f flen start j + 1) }
+        }
+      }
+    }
+  }
+}
+
+pkg_scan_bare is {
+  f buf flen i64 start i64 j i64 -> ret i64 {
+    when j >= flen {
+      true  -> { ret start * MAX_PKG + j - start }
+      false -> {
+        let b = at(f j)
+        when b == 32 {
+          true  -> { ret start * MAX_PKG + j - start }
+          false -> {
+            when b == 9 {
+              true  -> { ret start * MAX_PKG + j - start }
+              false -> {
+                when b == 10 {
+                  true  -> { ret start * MAX_PKG + j - start }
+                  false -> { self(f flen start j + 1) }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pkg_nth_token is {
+  f buf flen i64 i i64 k i64 -> ret i64 {
+    let i2 = pkg_skip_ws(f flen i)
+    when i2 >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let b = at(f i2)
+        when b == 10 {
+          true  -> { ret 0 - 1 }
+          false -> {
+            when k == 0 {
+              true -> {
+                when b == 34 {
+                  true  -> { ret pkg_scan_quoted(f flen i2 i2 + 1) }
+                  false -> { ret pkg_scan_bare(f flen i2 i2) }
+                }
+              }
+              false -> {
+                when b == 34 {
+                  true -> {
+                    let packed = pkg_scan_quoted(f flen i2 i2 + 1)
+                    when packed < 0 {
+                      true  -> { ret 0 - 1 }
+                      false -> {
+                        let q = packed / MAX_PKG
+                        let n = packed - q * MAX_PKG
+                        self(f flen q + n + 1 k - 1)
+                      }
+                    }
+                  }
+                  false -> {
+                    let packed = pkg_scan_bare(f flen i2 i2)
+                    let q = packed / MAX_PKG
+                    let n = packed - q * MAX_PKG
+                    self(f flen q + n k - 1)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pkg_slice is {
+  file buf packed i64 -> ret buf {
+    let q = packed / MAX_PKG
+    let n = packed - q * MAX_PKG
+    let out = alloc_or_die(n)
+    rt_copy_bytes(out 0 file q n)
+    ret out
+  }
+}
+
+// `version` + ws prefix.
+is_ver_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i + 8 > flen {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(f i)
+        let b1 = at(f i + 1)
+        let b2 = at(f i + 2)
+        let b3 = at(f i + 3)
+        let b4 = at(f i + 4)
+        let b5 = at(f i + 5)
+        let b6 = at(f i + 6)
+        let b7 = at(f i + 7)
+        when b0 == 118 {
+          true -> {
+            when b1 == 101 {
+              true -> {
+                when b2 == 114 {
+                  true -> {
+                    when b3 == 115 {
+                      true -> {
+                        when b4 == 105 {
+                          true -> {
+                            when b5 == 111 {
+                              true -> {
+                                when b6 == 110 {
+                                  true -> {
+                                    when b7 == 32 {
+                                      true  -> { ret 1 }
+                                      false -> {
+                                        when b7 == 9 {
+                                          true  -> { ret 1 }
+                                          false -> { ret 0 }
+                                        }
+                                      }
+                                    }
+                                  }
+                                  false -> { ret 0 }
+                                }
+                              }
+                              false -> { ret 0 }
+                            }
+                          }
+                          false -> { ret 0 }
+                        }
+                      }
+                      false -> { ret 0 }
+                    }
+                  }
+                  false -> { ret 0 }
+                }
+              }
+              false -> { ret 0 }
+            }
+          }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+buf_eq is {
+  a buf an i64 b buf bn i64 i i64 -> ret i64 {
+    when an == bn {
+      true -> {
+        when i >= an {
+          true  -> { ret 1 }
+          false -> {
+            let x = at(a i)
+            let y = at(b i)
+            when x == y {
+              true  -> { self(a an b bn i + 1) }
+              false -> { ret 0 }
+            }
+          }
+        }
+      }
+      false -> { ret 0 }
+    }
+  }
+}
+
+// Find the `version "<ver>"` line in pkg manifest.  Returns line off.
+find_ver_line is {
+  f buf flen i64 ver buf vn i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let is_v = is_ver_line(f flen i)
+        let ni = pkg_next_line(f flen i)
+        when is_v == 1 {
+          true -> {
+            let packed = pkg_nth_token(f flen i 1)
+            when packed < 0 {
+              true  -> { self(f flen ver vn ni) }
+              false -> {
+                let cand = pkg_slice(f packed)
+                let eq = buf_eq(cand size(cand) ver vn 0)
+                when eq == 1 {
+                  true  -> { ret i }
+                  false -> { self(f flen ver vn ni) }
+                }
+              }
+            }
+          }
+          false -> { self(f flen ver vn ni) }
+        }
+      }
+    }
+  }
+}
+
+// Tokens: 0 version 1 "<ver>" 2 git 3 "<url>" 4 rev 5 "<ref>".
+extract_url is {
+  f buf flen i64 line i64 -> ret buf {
+    let packed = pkg_nth_token(f flen line 3)
+    when packed < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> { ret pkg_slice(f packed) }
+    }
+  }
+}
+
+extract_ref is {
+  f buf flen i64 line i64 -> ret buf {
+    let packed = pkg_nth_token(f flen line 5)
+    when packed < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> { ret pkg_slice(f packed) }
+    }
+  }
+}
+
+// `clone_dep(url ref dir)` via /bin/sh -c.
+clone_dep is {
+  url buf ref buf dir buf -> ret i64 {
+    let p1 = concat("" "git clone --depth 1 --branch ")
+    let p2 = buf_concat(p1 ref)
+    let p3 = concat_buf(p2 " ")
+    let p4 = buf_concat(p3 url)
+    let p5 = concat_buf(p4 " ")
+    let p6 = buf_concat(p5 dir)
+    let sh = concat("" "/bin/sh")
+    let dashc = concat("" "-c")
+    let r = run3(sh dashc p6)
+    when r.0 {
+      :ok -> { ret r.1 }
+      _   -> { ret 0 - 1 }
+    }
+  }
+}
+
+// Append `dep "<name>" "<ver>"\n` to lake.house in cwd.  Read-modify-
+// write so we don't need O_APPEND (stdlib's `create` is O_TRUNC).
+// `house add` runs inside an existing project so the file is present.
+append_to_house is {
+  name buf ver buf m buf mlen i64 -> ret i64 {
+    let path = concat("" "lake.house")
+    let needs_lf = trailing_lf(m mlen)
+    let r = create(path MODE_644)
+    when r.0 {
+      :ok -> {
+        let fd = r.1
+        let _w0 = write(fd m mlen)
+        when needs_lf {
+          1 -> { let _wn = write_str(fd "\n") }
+          _ -> { }
+        }
+        let p1 = concat("" "dep \"")
+        let p2 = buf_concat(p1 name)
+        let p3 = concat_buf(p2 "\" \"")
+        let p4 = buf_concat(p3 ver)
+        let p5 = concat_buf(p4 "\"\n")
+        let pn = size(p5)
+        let _w = write(fd p5 pn)
+        close_file(fd)
+        ret 0
+      }
+      _ -> {
+        eprintln("house add: could not open lake.house for write")
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+trailing_lf is {
+  m buf n i64 -> ret i64 {
+    when n == 0 {
+      true  -> { ret 0 }
+      false -> {
+        let b = at(m n - 1)
+        when b == 10 {
+          true  -> { ret 0 }
+          false -> { ret 1 }
+        }
+      }
+    }
+  }
+}
+
+// ── existing lock rebuild ─────────────────────────────────────
+//
+// When `house add` rewrites lake.lock we preserve any other deps
+// already present in the consumer's lake.house, re-emitting their
+// (url, ref, sha) from the *existing* lake.lock (or freshly capturing
+// HEAD sha for cache-hit entries that pre-date the lock).  The newly
+// added dep is appended at the end.
+
+// Build the deps_blob for all bare deps in `lake.house` minus the
+// dep currently being added (it's appended after).  For each, prefer
+// the existing lock entry; else derive url+ref from registry and
+// capture sha from the cache dir.
+//
+// To keep this milestone tight, we only emit one entry per bare dep
+// using the existing lock when available; missing ones get url=""
+// ref=ver sha="" (the caller's next `house build` will fill them in).
+existing_deps_blob is {
+  m buf mlen i64 ndeps i64 i i64 acc buf skip_name buf skip_nn i64 lock_file buf lock_len i64 -> ret buf {
+    when i >= ndeps {
+      true  -> { ret acc }
+      false -> {
+        let name = dep_n_name(m mlen i)
+        let nn = size(name)
+        let same = buf_eq(name nn skip_name skip_nn 0)
+        let next_acc = build_existing_line(name nn same m mlen i acc lock_file lock_len)
+        self(m mlen ndeps i + 1 next_acc skip_name skip_nn lock_file lock_len)
+      }
+    }
+  }
+}
+
+build_existing_line is {
+  name buf nn i64 same i64 m buf mlen i64 i i64 acc buf lock_file buf lock_len i64 -> ret buf {
+    when same == 1 {
+      true  -> { ret acc }
+      false -> {
+        let kind = dep_n_kind(m mlen i)
+        when kind == DEP_BARE {
+          true  -> { ret merge_existing_dep(name m mlen i acc lock_file lock_len) }
+          false -> { ret acc }
+        }
+      }
+    }
+  }
+}
+
+merge_existing_dep is {
+  name buf m buf mlen i64 i i64 acc buf lock_file buf lock_len i64 -> ret buf {
+    let ver = dep_n_source(m mlen i)
+    let url = lookup_or_empty(lock_file lock_len name ver 4)
+    let ref = lookup_or_empty_default(lock_file lock_len name ver 6 ver)
+    let sha = lookup_or_empty(lock_file lock_len name ver 8)
+    let line = build_dep_line(name ver url ref sha)
+    ret buf_concat(acc line)
+  }
+}
+
+lookup_or_empty is {
+  lock_file buf lock_len i64 name buf ver buf tok i64 -> ret buf {
+    when lock_len == 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        when tok == 4 {
+          true  -> { ret lookup_url_or_empty(lock_file lock_len name ver) }
+          false -> {
+            when tok == 8 {
+              true  -> { ret lookup_sha_or_empty(lock_file lock_len name ver) }
+              false -> { ret alloc_or_die(0) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+lookup_or_empty_default is {
+  lock_file buf lock_len i64 name buf ver buf tok i64 fallback buf -> ret buf {
+    when lock_len == 0 {
+      true  -> { ret fallback }
+      false -> {
+        let r = lookup_ref_or_empty(lock_file lock_len name ver)
+        let rn = size(r)
+        when rn == 0 {
+          true  -> { ret fallback }
+          false -> { ret r }
+        }
+      }
+    }
+  }
+}
+
+lookup_url_or_empty is {
+  lock_file buf lock_len i64 name buf ver buf -> ret buf {
+    ret lock_url(lock_file lock_len name ver)
+  }
+}
+
+lookup_ref_or_empty is {
+  lock_file buf lock_len i64 name buf ver buf -> ret buf {
+    ret lock_ref(lock_file lock_len name ver)
+  }
+}
+
+lookup_sha_or_empty is {
+  lock_file buf lock_len i64 name buf ver buf -> ret buf {
+    ret lock_sha(lock_file lock_len name ver)
+  }
+}
+
+// ── orchestration ─────────────────────────────────────────────
+
+pub add_dep is {
+  name buf ver buf -> ret i64 {
+    print("[add] ")
+    print_buf(name)
+    print(" ")
+    println_buf(ver)
+    let path = concat("" "lake.house")
+    let m = load(path)
+    let mlen = size(m)
+    let manifest_url = manifest_registry_url(m mlen)
+    let reg_url = pick_registry_url(manifest_url)
+    print("[add] registry ")
+    println_buf(reg_url)
+    let upd = update_index(reg_url)
+    when upd < 0 {
+      true  -> {
+        eprintln("[add] could not refresh registry index")
+        ret 0 - 1
+      }
+      false -> { ret add_after_index(name ver m mlen) }
+    }
+  }
+}
+
+add_after_index is {
+  name buf ver buf m buf mlen i64 -> ret i64 {
+    let pkg_path = shard_path(name)
+    let pkg = read_all(pkg_path)
+    let pn = size(pkg)
+    when pn == 0 {
+      true  -> {
+        eprintln("[add] package not in registry:")
+        print("  ")
+        println_buf(name)
+        ret 0 - 1
+      }
+      false -> { ret add_with_pkg(name ver m mlen pkg pn) }
+    }
+  }
+}
+
+add_with_pkg is {
+  name buf ver buf m buf mlen i64 pkg buf pn i64 -> ret i64 {
+    let vn = size(ver)
+    let line = find_ver_line(pkg pn ver vn 0)
+    when line < 0 {
+      true  -> {
+        eprintln("[add] no matching version:")
+        print("  ")
+        print_buf(name)
+        print(" ")
+        println_buf(ver)
+        ret 0 - 1
+      }
+      false -> { ret add_with_line(name ver m mlen pkg pn line) }
+    }
+  }
+}
+
+add_with_line is {
+  name buf ver buf m buf mlen i64 pkg buf pn i64 line i64 -> ret i64 {
+    let url = extract_url(pkg pn line)
+    let ref = extract_ref(pkg pn line)
+    let un = size(url)
+    let rn = size(ref)
+    when un == 0 {
+      true  -> {
+        eprintln("[add] registry entry missing git url")
+        ret 0 - 1
+      }
+      false -> {
+        when rn == 0 {
+          true  -> {
+            eprintln("[add] registry entry missing rev")
+            ret 0 - 1
+          }
+          false -> { ret add_clone(name ver url ref m mlen) }
+        }
+      }
+    }
+  }
+}
+
+add_clone is {
+  name buf ver buf url buf ref buf m buf mlen i64 -> ret i64 {
+    let dir = lib_dir(name ver)
+    let cached = is_installed(dir)
+    when cached == 1 {
+      true -> {
+        print("[add] cached ")
+        print_buf(name)
+        print("@")
+        println_buf(ver)
+      }
+      false -> {
+        print("[add] cloning ")
+        print_buf(name)
+        print("@")
+        println_buf(ver)
+        pin clone_dep(url ref dir)
+      }
+    }
+    let sha = head_sha(dir)
+    pin append_to_house(name ver m mlen)
+    ret rebuild_lock(name ver url ref sha m mlen)
+  }
+}
+
+rebuild_lock is {
+  name buf ver buf url buf ref buf sha buf m buf mlen i64 -> ret i64 {
+    let lock_path = concat("" "lake.lock")
+    let lock_file = load_lock(lock_path)
+    let lock_len = size(lock_file)
+    let nn = size(name)
+    let ndeps = dep_count(m mlen)
+    let empty = alloc_or_die(0)
+    let preserved = existing_deps_blob(m mlen ndeps 0 empty name nn lock_file lock_len)
+    let new_line = build_dep_line(name ver url ref sha)
+    let blob = buf_concat(preserved new_line)
+    let pname = parse_project_name(m mlen)
+    let pver = parse_project_version(m mlen)
+    let body = build_lock_body(pname pver blob)
+    let w = write_lock(lock_path body)
+    when w {
+      0 -> {
+        print("[add] ")
+        print_buf(name)
+        print(" ")
+        print_buf(ver)
+        print(" added.  See lake.lock for pinned SHA ")
+        println_buf(sha)
+        ret 0
+      }
+      _ -> {
+        eprintln("[add] failed to write lake.lock")
+        ret 0 - 1
+      }
+    }
+  }
+}

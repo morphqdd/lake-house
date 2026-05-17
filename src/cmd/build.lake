@@ -12,7 +12,7 @@
 +std.experimental.fs.{ cstr_of }
 +std.experimental.process.{ run_envp }
 +std.io.{ print println eprintln print_buf println_buf }
-+manifest.{ dep_count dep_n_name dep_n_source dep_n_override }
++manifest.{ dep_count dep_n_name dep_n_source dep_n_override manifest_registry_url }
 +cache.{ lib_dir buf_concat }
 +cmd.install.{ install_dep }
 
@@ -205,9 +205,9 @@ copy_env_ptrs is {
 // Iterate deps, install missing ones, and accumulate their env
 // entries into `slots[off..]`.  Returns the post-fill offset.
 //
-// State carried: `(file flen ndeps i slots off)`.
+// State carried: `(file flen ndeps i slots off reg_url)`.
 fill_dep_env is {
-  file buf flen i64 ndeps i64 i i64 slots buf off i64 -> ret i64 {
+  file buf flen i64 ndeps i64 i i64 slots buf off i64 reg_url buf -> ret i64 {
     when i >= ndeps {
       true  -> { ret off }
       false -> {
@@ -216,13 +216,13 @@ fill_dep_env is {
         let override = dep_n_override(file flen i)
         let ov_size = size(override)
         when ov_size == 0 {
-          true  -> { pin install_dep(name source) }
+          true  -> { pin install_dep(name source reg_url) }
           false -> { }
         }
         let dir = resolve_dep_dir(name source override)
         let entry = build_env_entry(name dir)
         rt_store(slots addr(entry) 8 off)
-        self(file flen ndeps i + 1 slots off + 8)
+        self(file flen ndeps i + 1 slots off + 8 reg_url)
       }
     }
   }
@@ -239,7 +239,8 @@ pub build_envp is {
     let total_slots = existing + ndeps + 2
     let envp = alloc_or_die(total_slots * 8)
     pin copy_env_ptrs(envp base 0 existing)
-    let post_dep = fill_dep_env(file flen ndeps 0 envp existing * 8)
+    let reg_url = manifest_registry_url(file flen)
+    let post_dep = fill_dep_env(file flen ndeps 0 envp existing * 8 reg_url)
     let lake_cstr = cstr_of(concat("" "LAKE_PATH=/home/morphe/compiler/lake-stdlib"))
     rt_store(envp addr(lake_cstr) 8 post_dep)
     rt_store(envp 0 8 post_dep + 8)

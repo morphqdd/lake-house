@@ -16,6 +16,7 @@
 +std.experimental.fs.{ mkdir MODE_755 }
 +std.io.{ print println eprintln print_buf println_buf }
 +cache.{ lib_dir cache_root buf_concat is_installed }
++registry.{ resolve_registry_dep }
 
 @rt(rt_copy_bytes)
 
@@ -129,18 +130,17 @@ ensure_parents is {
   }
 }
 
-// `install_dep(name, source)` — top-level entry point.  Skips if
-// the cache entry already exists, otherwise dispatches by source
-// shape.  Returns 0 on success (including skipped), -1 on error.
+// `install_dep(name, source, registry_url)` — top-level entry point.
+// Skips if the cache entry already exists, otherwise dispatches by
+// source shape.  `registry_url` is the manifest-level override (may
+// be an empty buf — env var / default kick in inside the resolver).
+// Returns 0 on success (including skipped), -1 on error.
 pub install_dep is {
-  name buf source buf -> ret i64 {
+  name buf source buf registry_url buf -> ret i64 {
     let is_git = is_git_source(source)
     when is_git == 1 {
       true  -> { ret install_git(name source) }
-      false -> {
-        eprintln("house: registry fetch not yet implemented")
-        ret 0 - 1
-      }
+      false -> { ret resolve_registry_dep(name source registry_url) }
     }
   }
 }

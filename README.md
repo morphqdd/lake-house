@@ -12,6 +12,7 @@ commands ship as new source files compiled into the binary.
 | `house new <name>`      | scaffold a new project directory             |
 | `house build`           | install deps + run `lakec` on `entry`        |
 | `house run`             | `build` + exec the produced binary           |
+| `house publish`         | append current pkg to registry + push        |
 | `house help`            | print usage                                  |
 
 ## Manifest (`lake.house`)
@@ -76,6 +77,37 @@ why imports use the *underscored* form:
 ```sh
 LAKE_PATH=../lake-stdlib lakec src/main.lake
 ```
+
+## Publishing
+
+`house publish` runs from inside a project directory and appends the
+current `project "<name>" "<version>"` to the registry index, then
+commits + pushes.  Flow:
+
+1. read `lake.house`, parse name + version + optional `registry "<url>"`,
+2. refresh `~/.lake/index/` from the picked registry URL (env
+   `LAKE_REGISTRY` > manifest `registry` > built-in default),
+3. capture `git config --get remote.origin.url` of the current repo
+   (used as the dep's git url),
+4. capture `git describe --tags --exact-match` (preferred) or
+   `git rev-parse HEAD` (fallback) for the rev,
+5. compute the shard path
+   `~/.lake/index/packages/<first-letter>/<name>.lake`,
+6. refuse if the file already has a `version "<v>"` line for the
+   current version,
+7. otherwise create the file with a `package "<name>"` header (or
+   append a new line if the file exists),
+8. `git add` / `commit -m "publish: <name> <v>"` / `push origin HEAD`
+   inside the registry checkout.
+
+Capturing process output: `std.experimental.process.run3` inherits
+the parent's stdio, so `house` redirects the git command's stdout
+into `/tmp/lake-house-<stem>-<pid>` via `/bin/sh -c "<cmd> > <file>"`
+and reads the file back (see `src/cmd/git_capture.lake`).
+
+If the push fails (auth, sandbox, offline), `house` prints the
+exact `git add` / `commit` / `push` invocations the user can run
+manually against the registry checkout.
 
 ## Example
 

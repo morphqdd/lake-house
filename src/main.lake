@@ -9,7 +9,7 @@
 +std.sys.{ exit }
 +std.strings.{ concat concat_buf }
 +std.bytes.{ size }
-+std.experimental.fs.{ mkdir create close write_str MODE_755 MODE_644 }
++std.experimental.fs.{ mkdir create close_file write_str MODE_755 MODE_644 }
 +std.experimental.process.{ run }
 +manifest.{ load parse_entry }
 
@@ -54,7 +54,7 @@ write_file is {
       :ok -> {
         let fd = r.1
         let _w = write_str(fd content)
-        let _c = close(fd)
+        let _c = close_file(fd)
         ret 0
       }
       _ -> {

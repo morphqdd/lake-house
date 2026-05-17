@@ -5,15 +5,15 @@
 //     project "myapp" "0.1.0"
 //     entry   "src/main.lake"
 //     dep     "lake-rails" "0.1.0"
+//     dep     "marine"     "git+https://github.com/morphqdd/marine#dev"
+//     dep     "lash"       "0.2.0" path "/abs/path"
 //
-// Phase 3 only extracts the `entry "<path>"` value — enough for
-// the build/run dispatchers in Phase 4.  project/version/deps
-// land in later phases when there are consumers.
+// See docs/state/features/082_house_deps.md (lake-native-compiler)
 
-+std.experimental.fs.{ open close read }
++std.experimental.fs.{ open close_file read }
 +std.experimental.sys.{ O_RDONLY }
 +std.process.{ alloc_or_die die }
-+std.bytes.{ at trim }
++std.bytes.{ at trim size }
 +std.io.{ eprintln print }
 
 @rt(rt_copy_bytes)
@@ -32,7 +32,7 @@ pub load is {
           :ok -> {
             let n = rr.1
             let _tp = trim(payload n)
-            close(fd)
+            close_file(fd)
             ret payload
           }
           _ -> {
@@ -52,18 +52,11 @@ pub load is {
 }
 
 // FSM that walks the manifest body looking for `entry "<path>"`.
-// All state lives in the machine's arguments so the parser is a
-// single ret-machine; no helper ret-machines to chain.
-//
 // State `s`:
-//   0..4 — matching e n t r y    (ASCII 101 110 116 114 121)
+//   0..4 — matching e n t r y
 //   5    — past 'entry', skipping until opening `"`
 //   6    — between quotes, collecting payload until closing `"`
-// `q` is the index of the first payload byte (state-5 → state-6).
-//
-// Returns packed `q * MAX_MANIFEST + length` on success, -1 on
-// EOF before the pattern is found.  The payload bytes are at
-// `file[q .. q + length]`.
+// Returns packed `q * MAX_MANIFEST + length` on success, -1 on EOF.
 scan_entry is {
   f buf flen i64 i i64 s i64 q i64 -> ret i64 {
     when i >= flen {
@@ -159,6 +152,308 @@ pub parse_entry is {
         let _t = trim(out n)
         ret out
       }
+    }
+  }
+}
+
+// ── dep parsing ─────────────────────────────────────────────────
+//
+// Line iteration: `line_at(f, flen, i)` advances `i` until the
+// previous byte was `\n` or `i == flen` and returns the new offset.
+// `next_line(f, flen, i)` skips to the next line start (past the
+// next `\n`).  Returns flen on EOF.
+
+next_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret flen }
+      false -> {
+        let b = at(f i)
+        let ni = i + 1
+        when b == 10 {
+          true  -> { ret ni }
+          false -> { self(f flen ni) }
+        }
+      }
+    }
+  }
+}
+
+// Skip ASCII whitespace (space, tab) starting at `i`.  Stops at
+// `\n` so callers can detect end-of-line.
+skip_ws is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret i }
+      false -> {
+        let b = at(f i)
+        when b == 32 {
+          true  -> { self(f flen i + 1) }
+          false -> {
+            when b == 9 {
+              true  -> { self(f flen i + 1) }
+              false -> { ret i }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Walk a quoted-string token starting at `i` (which points at the
+// opening `"`).  Returns packed (start * MAX_MANIFEST + length) of
+// the *contents* (no quotes).  `-1` if EOF before closing `"`.
+//
+// `j` tracks the inner cursor; payload starts at `i + 1`.
+scan_quoted is {
+  f buf flen i64 start i64 j i64 -> ret i64 {
+    when j >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let b = at(f j)
+        when b == 34 {
+          true  -> {
+            let q = start + 1
+            ret q * MAX_MANIFEST + j - q
+          }
+          false -> { self(f flen start j + 1) }
+        }
+      }
+    }
+  }
+}
+
+// Walk a bare (unquoted) token: alphanumerics + `-` `_` `.` `+` `:`
+// `/` `#`.  Stops at whitespace, `\n`, or EOF.  Returns packed
+// (start * MAX_MANIFEST + length).
+scan_bare is {
+  f buf flen i64 start i64 j i64 -> ret i64 {
+    when j >= flen {
+      true  -> { ret start * MAX_MANIFEST + j - start }
+      false -> {
+        let b = at(f j)
+        when b == 32 {
+          true  -> { ret start * MAX_MANIFEST + j - start }
+          false -> {
+            when b == 9 {
+              true  -> { ret start * MAX_MANIFEST + j - start }
+              false -> {
+                when b == 10 {
+                  true  -> { ret start * MAX_MANIFEST + j - start }
+                  false -> { self(f flen start j + 1) }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Walk forward to the start of the `k`-th token on a line that
+// begins at `line_off`.  Returns the byte offset of that token's
+// first content byte (so for a quoted token, the byte after the
+// opening `"`) and its length, packed.  `-1` if the line ends
+// before token `k`.
+//
+// State `k_remaining`: how many tokens still to skip.  When 0 we
+// extract the token at the current position.
+nth_token is {
+  f buf flen i64 i i64 k i64 -> ret i64 {
+    let i2 = skip_ws(f flen i)
+    when i2 >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let b = at(f i2)
+        when b == 10 {
+          true  -> { ret 0 - 1 }
+          false -> {
+            when k == 0 {
+              true -> {
+                when b == 34 {
+                  true  -> { ret scan_quoted(f flen i2 i2 + 1) }
+                  false -> { ret scan_bare(f flen i2 i2) }
+                }
+              }
+              false -> {
+                when b == 34 {
+                  true -> {
+                    let packed = scan_quoted(f flen i2 i2 + 1)
+                    when packed < 0 {
+                      true  -> { ret 0 - 1 }
+                      false -> {
+                        let q = packed / MAX_MANIFEST
+                        let n = packed - q * MAX_MANIFEST
+                        self(f flen q + n + 1 k - 1)
+                      }
+                    }
+                  }
+                  false -> {
+                    let packed = scan_bare(f flen i2 i2)
+                    let q = packed / MAX_MANIFEST
+                    let n = packed - q * MAX_MANIFEST
+                    self(f flen q + n k - 1)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Is the line at `line_off` a `dep` line?  We accept the literal
+// 3-char prefix `dep` followed by ASCII whitespace.  No comment-
+// stripping yet — lake.house is small enough that users can avoid
+// comment lines.
+is_dep_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i + 4 > flen {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(f i)
+        let b1 = at(f i + 1)
+        let b2 = at(f i + 2)
+        let b3 = at(f i + 3)
+        when b0 == 100 {
+          true -> {
+            when b1 == 101 {
+              true -> {
+                when b2 == 112 {
+                  true -> {
+                    when b3 == 32 {
+                      true  -> { ret 1 }
+                      false -> {
+                        when b3 == 9 {
+                          true  -> { ret 1 }
+                          false -> { ret 0 }
+                        }
+                      }
+                    }
+                  }
+                  false -> { ret 0 }
+                }
+              }
+              false -> { ret 0 }
+            }
+          }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// Count `dep` lines in the manifest.  Tail-recursive accumulator.
+dep_count_at is {
+  f buf flen i64 i i64 acc i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret acc }
+      false -> {
+        let is_dep = is_dep_line(f flen i)
+        let ni = next_line(f flen i)
+        when is_dep == 1 {
+          true  -> { self(f flen ni acc + 1) }
+          false -> { self(f flen ni acc) }
+        }
+      }
+    }
+  }
+}
+
+pub dep_count is {
+  file buf flen i64 -> ret i64 {
+    ret dep_count_at(file flen 0 0)
+  }
+}
+
+// Find offset of the `n`-th dep line.  Returns -1 if not present.
+dep_line_at is {
+  f buf flen i64 i i64 n i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let is_dep = is_dep_line(f flen i)
+        let ni = next_line(f flen i)
+        when is_dep == 1 {
+          true -> {
+            when n == 0 {
+              true  -> { ret i }
+              false -> { self(f flen ni n - 1) }
+            }
+          }
+          false -> { self(f flen ni n) }
+        }
+      }
+    }
+  }
+}
+
+// Extract a fresh buf from a packed (offset, length) reference.
+slice_packed is {
+  file buf packed i64 -> ret buf {
+    let q = packed / MAX_MANIFEST
+    let n = packed - q * MAX_MANIFEST
+    let out = alloc_or_die(n)
+    rt_copy_bytes(out 0 file q n)
+    let _t = trim(out n)
+    ret out
+  }
+}
+
+// Read the `tok`-th token of the `n`-th dep line as a fresh buf.
+// `tok == 0` is the bare `dep`, `tok == 1` is the name, `tok == 2`
+// is the source string, `tok == 3` is the literal `path` (if the
+// line has an override), `tok == 4` is the override path.
+//
+// Returns an empty buf (length 0) if the token is absent.
+pub dep_n_token is {
+  file buf flen i64 n i64 tok i64 -> ret buf {
+    let line = dep_line_at(file flen 0 n)
+    when line < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let packed = nth_token(file flen line tok)
+        when packed < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> { ret slice_packed(file packed) }
+        }
+      }
+    }
+  }
+}
+
+// Convenience wrappers — name (token 1), source (token 2), override
+// path (token 4 if token 3 == "path", else empty).
+pub dep_n_name is {
+  file buf flen i64 n i64 -> ret buf {
+    ret dep_n_token(file flen n 1)
+  }
+}
+
+pub dep_n_source is {
+  file buf flen i64 n i64 -> ret buf {
+    ret dep_n_token(file flen n 2)
+  }
+}
+
+pub dep_n_override is {
+  file buf flen i64 n i64 -> ret buf {
+    let kw = dep_n_token(file flen n 3)
+    let klen = size(kw)
+    when klen == 4 {
+      true -> {
+        let b0 = at(kw 0)
+        when b0 == 112 {
+          true  -> { ret dep_n_token(file flen n 4) }
+          false -> { ret alloc_or_die(0) }
+        }
+      }
+      false -> { ret alloc_or_die(0) }
     }
   }
 }

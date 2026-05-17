@@ -1,0 +1,140 @@
+// Dep cache layout — `~/.lake/libs/<name>/<version-or-ref>/`.
+//
+// Each dep checkout lives under its own version-or-ref directory
+// so multiple manifests in the same machine can share immutable
+// snapshots.  No locking yet — `install_dep` is the single writer.
+//
+// See docs/state/features/082_house_deps.md (lake-native-compiler)
+
++std.env.{ envp_at }
++std.bytes.{ size at }
++std.process.{ alloc_or_die }
++std.strings.{ concat_buf concat }
++std.experimental.fs.{ open close_file }
++std.experimental.sys.{ O_RDONLY }
+
+@rt(rt_copy_bytes)
+
+// Walk envp for `HOME=<value>` and return the value as a fresh
+// buf.  Returns empty buf if HOME is absent (extremely rare on a
+// real Linux process, but we tolerate it so the smoke build can
+// run under stripped envs).
+//
+// State `i` is the envp index.  We scan until envp_at(i) reports
+// `:err` (past the NULL terminator).
+home_at is {
+  i i64 -> ret buf {
+    let r = envp_at(i)
+    when r.0 {
+      :ok -> {
+        let e = r.1
+        let n = size(e)
+        when n >= 5 {
+          true -> {
+            let b0 = at(e 0)
+            let b1 = at(e 1)
+            let b2 = at(e 2)
+            let b3 = at(e 3)
+            let b4 = at(e 4)
+            when b0 == 72 {
+              true -> {
+                when b1 == 79 {
+                  true -> {
+                    when b2 == 77 {
+                      true -> {
+                        when b3 == 69 {
+                          true -> {
+                            when b4 == 61 {
+                              true  -> { ret slice_after_eq(e n 5) }
+                              false -> { self(i + 1) }
+                            }
+                          }
+                          false -> { self(i + 1) }
+                        }
+                      }
+                      false -> { self(i + 1) }
+                    }
+                  }
+                  false -> { self(i + 1) }
+                }
+              }
+              false -> { self(i + 1) }
+            }
+          }
+          false -> { self(i + 1) }
+        }
+      }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// Copy `src[off..size(src)]` into a fresh buf.  Used to split the
+// value out of `HOME=/home/me` after the `=` at index 4.
+slice_after_eq is {
+  src buf src_size i64 off i64 -> ret buf {
+    let n = src_size - off
+    let out = alloc_or_die(n)
+    rt_copy_bytes(out 0 src off n)
+    ret out
+  }
+}
+
+// `cache_root()` — `<HOME>/.lake/libs`.  Result is a fresh buf.
+pub cache_root is {
+  _ -> ret buf {
+    let h = home_at(0)
+    ret concat_buf(h "/.lake/libs")
+  }
+}
+
+// `lib_dir(name, version_or_ref)` — `<cache_root>/<name>/<ver>`.
+// Returns a fresh buf.  `version_or_ref` is the resolved ref (e.g.
+// `dev` for a `git+...#dev` source, or `0.1.0` for a semver dep).
+pub lib_dir is {
+  name buf ver buf -> ret buf {
+    let root = cache_root()
+    let s1 = concat_buf(root "/")
+    let s2 = concat_bb(s1 name)
+    let s3 = concat_buf(s2 "/")
+    let s4 = concat_bb(s3 ver)
+    ret s4
+  }
+}
+
+// `buf ++ buf` — strings.lake only ships `buf ++ str`.  Local
+// helper so cache assembly doesn't need a stdlib extension.
+concat_bb is {
+  a buf b buf -> ret buf {
+    let la = size(a)
+    let lb = size(b)
+    let out = alloc_or_die(la + lb)
+    rt_copy_bytes(out 0  a 0 la)
+    rt_copy_bytes(out la b 0 lb)
+    ret out
+  }
+}
+
+// Public re-export so other modules don't redefine the helper.
+pub buf_concat is {
+  a buf b buf -> ret buf {
+    ret concat_bb(a b)
+  }
+}
+
+// `is_installed(dir)` — 1 iff `dir` exists and is openable.  Opens
+// `dir` read-only (succeeds for directories on Linux), closes the
+// fd, returns 1.  Any errno -> 0.  Used by `install_dep` to skip
+// the clone when the cache already contains a checkout.
+pub is_installed is {
+  dir buf -> ret i64 {
+    let r = open(dir O_RDONLY 0)
+    when r.0 {
+      :ok -> {
+        let _c = close_file(r.1)
+        ret 1
+      }
+      _ -> { ret 0 }
+    }
+  }
+}

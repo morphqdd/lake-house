@@ -457,3 +457,177 @@ pub dep_n_override is {
     }
   }
 }
+
+// `dep_n_kind(file, flen, n)` — classify the `n`-th dep's source
+// shape as an integer code:
+//   0 — :bare (registry-resolved semver-style version).
+//   1 — :git  (source begins with `git+`).
+//   2 — :path (explicit `path "<dir>"` override).
+//
+// Kept as i64 (not atom) because Lake's surface syntax doesn't
+// allow `ret atom` as a return type — only tuple shapes.
+pub const DEP_BARE = 0
+pub const DEP_GIT  = 1
+pub const DEP_PATH = 2
+
+pub dep_n_kind is {
+  file buf flen i64 n i64 -> ret i64 {
+    let kw = dep_n_token(file flen n 3)
+    let klen = size(kw)
+    when klen == 4 {
+      true -> {
+        let b0 = at(kw 0)
+        when b0 == 112 {
+          true  -> { ret DEP_PATH }
+          false -> { ret kind_from_source(file flen n) }
+        }
+      }
+      false -> { ret kind_from_source(file flen n) }
+    }
+  }
+}
+
+kind_from_source is {
+  file buf flen i64 n i64 -> ret i64 {
+    let src = dep_n_source(file flen n)
+    let sn = size(src)
+    when sn < 4 {
+      true  -> { ret DEP_BARE }
+      false -> {
+        let b0 = at(src 0)
+        let b1 = at(src 1)
+        let b2 = at(src 2)
+        let b3 = at(src 3)
+        when b0 == 103 {
+          true -> {
+            when b1 == 105 {
+              true -> {
+                when b2 == 116 {
+                  true -> {
+                    when b3 == 43 {
+                      true  -> { ret DEP_GIT }
+                      false -> { ret DEP_BARE }
+                    }
+                  }
+                  false -> { ret DEP_BARE }
+                }
+              }
+              false -> { ret DEP_BARE }
+            }
+          }
+          false -> { ret DEP_BARE }
+        }
+      }
+    }
+  }
+}
+
+// ── top-level keys (registry) ──────────────────────────────────
+//
+// Optional `registry "<url>"` line in `lake.house`.  Scanned with
+// the same FSM-on-prefix style as `entry`.  Returns an empty buf if
+// the line is missing — callers fall back to env var / default.
+
+is_registry_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i + 9 > flen {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(f i)
+        let b1 = at(f i + 1)
+        let b2 = at(f i + 2)
+        let b3 = at(f i + 3)
+        let b4 = at(f i + 4)
+        let b5 = at(f i + 5)
+        let b6 = at(f i + 6)
+        let b7 = at(f i + 7)
+        let b8 = at(f i + 8)
+        when b0 == 114 {
+          true -> {
+            when b1 == 101 {
+              true -> {
+                when b2 == 103 {
+                  true -> {
+                    when b3 == 105 {
+                      true -> {
+                        when b4 == 115 {
+                          true -> {
+                            when b5 == 116 {
+                              true -> {
+                                when b6 == 114 {
+                                  true -> {
+                                    when b7 == 121 {
+                                      true -> {
+                                        when b8 == 32 {
+                                          true  -> { ret 1 }
+                                          false -> {
+                                            when b8 == 9 {
+                                              true  -> { ret 1 }
+                                              false -> { ret 0 }
+                                            }
+                                          }
+                                        }
+                                      }
+                                      false -> { ret 0 }
+                                    }
+                                  }
+                                  false -> { ret 0 }
+                                }
+                              }
+                              false -> { ret 0 }
+                            }
+                          }
+                          false -> { ret 0 }
+                        }
+                      }
+                      false -> { ret 0 }
+                    }
+                  }
+                  false -> { ret 0 }
+                }
+              }
+              false -> { ret 0 }
+            }
+          }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+find_registry_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let is_r = is_registry_line(f flen i)
+        when is_r == 1 {
+          true  -> { ret i }
+          false -> {
+            let ni = next_line(f flen i)
+            self(f flen ni)
+          }
+        }
+      }
+    }
+  }
+}
+
+// `manifest_registry_url(file, flen)` — the `registry "<url>"`
+// value or an empty buf if absent.
+pub manifest_registry_url is {
+  file buf flen i64 -> ret buf {
+    let line = find_registry_line(file flen 0)
+    when line < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let packed = nth_token(file flen line 1)
+        when packed < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> { ret slice_packed(file packed) }
+        }
+      }
+    }
+  }
+}

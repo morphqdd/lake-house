@@ -10,8 +10,10 @@
 +std.bytes.{ size at }
 +std.process.{ alloc_or_die }
 +std.strings.{ concat_buf concat }
-+std.experimental.fs.{ open close_file }
++std.experimental.fs.{ open close_file mkdir MODE_755 }
 +std.experimental.sys.{ O_RDONLY }
++std.experimental.process.{ run3 }
++std.io.{ println eprintln }
 
 @rt(rt_copy_bytes)
 
@@ -135,6 +137,174 @@ pub is_installed is {
         ret 1
       }
       _ -> { ret 0 }
+    }
+  }
+}
+
+// `home_dir()` — `<HOME>` as a fresh buf.  Public so other modules
+// (registry) can assemble sibling cache paths.
+pub home_dir is {
+  _ -> ret buf {
+    ret home_at(0)
+  }
+}
+
+// `dot_lake_dir()` — `<HOME>/.lake`.
+pub dot_lake_dir is {
+  _ -> ret buf {
+    let h = home_at(0)
+    ret concat_buf(h "/.lake")
+  }
+}
+
+// `index_dir()` — `<HOME>/.lake/index`.  Where the registry git
+// checkout lives (clone-of-clone semantics: one shallow clone per
+// machine, refreshed on demand).
+pub index_dir is {
+  _ -> ret buf {
+    let h = home_at(0)
+    ret concat_buf(h "/.lake/index")
+  }
+}
+
+// `mkdir_p_silent(path)` — mkdir, EEXIST = ok.  Local copy so
+// cache.lake doesn't need to depend on install.lake.
+mkdir_p_silent is {
+  path buf -> ret i64 {
+    let r = mkdir(path MODE_755)
+    when r.0 {
+      :ok -> { ret 0 }
+      :err -> {
+        when r.1 {
+          17 -> { ret 0 }
+          _  -> { ret 0 - 1 }
+        }
+      }
+    }
+  }
+}
+
+// `update_index(registry_url)` — clone or pull `~/.lake/index/`.
+// If the dir doesn't exist, `git clone --depth 1 <url> <dir>`.
+// Otherwise `git -C <dir> pull --ff-only --quiet` (best-effort —
+// failure to refresh is a warning, not a hard error, so offline
+// builds against an already-fresh index still work).
+//
+// Returns 0 on success, -1 on clone failure (the only fatal path).
+pub update_index is {
+  url buf -> ret i64 {
+    let dir = index_dir()
+    let cached = is_installed(dir)
+    when cached == 1 {
+      true  -> { ret pull_index(dir) }
+      false -> { ret clone_index(url dir) }
+    }
+  }
+}
+
+// `git clone --depth 1 <url> <dir>` via /bin/sh -c.
+clone_index is {
+  url buf dir buf -> ret i64 {
+    let dot = dot_lake_dir()
+    pin mkdir_p_silent(dot)
+    println("[deps] cloning registry index")
+    let p1 = concat("" "git clone --depth 1 ")
+    let p2 = concat_bb(p1 url)
+    let p3 = concat_buf(p2 " ")
+    let p4 = concat_bb(p3 dir)
+    let sh = concat("" "/bin/sh")
+    let dashc = concat("" "-c")
+    let r = run3(sh dashc p4)
+    when r.0 {
+      :ok -> {
+        when r.1 {
+          0 -> { ret 0 }
+          _ -> {
+            eprintln("[deps] registry clone failed")
+            ret 0 - 1
+          }
+        }
+      }
+      _ -> {
+        eprintln("[deps] failed to spawn shell for clone")
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+// `git -C <dir> fetch && git -C <dir> reset --hard origin/HEAD` —
+// hard refresh so a force-push to the registry doesn't desync the
+// local mirror.  Best-effort: any failure is a warning.
+pull_index is {
+  dir buf -> ret i64 {
+    let p1 = concat("" "git -C ")
+    let p2 = concat_bb(p1 dir)
+    let p3 = concat_buf(p2 " fetch --quiet --depth 1 origin && git -C ")
+    let p4 = concat_bb(p3 dir)
+    let p5 = concat_buf(p4 " reset --hard --quiet origin/HEAD")
+    let sh = concat("" "/bin/sh")
+    let dashc = concat("" "-c")
+    let r = run3(sh dashc p5)
+    when r.0 {
+      :ok -> { ret 0 }
+      _   -> { ret 0 }
+    }
+  }
+}
+
+// `getenv_buf(name)` — walk envp for `<name>=<value>` and return
+// the value as a fresh buf.  Empty buf if missing.  Used by
+// registry.lake for `LAKE_REGISTRY` lookup; generalised version of
+// `home_at` that takes the prefix as a buf.
+pub getenv_buf is {
+  name buf -> ret buf {
+    ret getenv_scan(name size(name) 0)
+  }
+}
+
+getenv_scan is {
+  name buf nlen i64 i i64 -> ret buf {
+    let r = envp_at(i)
+    when r.0 {
+      :ok -> {
+        let e = r.1
+        let elen = size(e)
+        when elen >= nlen + 1 {
+          true -> {
+            let m = match_prefix(name nlen e 0)
+            when m == 1 {
+              true -> {
+                let eq = at(e nlen)
+                when eq == 61 {
+                  true  -> { ret slice_after_eq(e elen nlen + 1) }
+                  false -> { self(name nlen i + 1) }
+                }
+              }
+              false -> { self(name nlen i + 1) }
+            }
+          }
+          false -> { self(name nlen i + 1) }
+        }
+      }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// Tail-recursive prefix-match: 1 iff `name[0..nlen] == e[k..k+nlen]`.
+match_prefix is {
+  name buf nlen i64 e buf k i64 -> ret i64 {
+    when k >= nlen {
+      true  -> { ret 1 }
+      false -> {
+        let a = at(name k)
+        let b = at(e k)
+        when a == b {
+          true  -> { self(name nlen e k + 1) }
+          false -> { ret 0 }
+        }
+      }
     }
   }
 }

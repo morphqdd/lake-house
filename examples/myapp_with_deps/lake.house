@@ -1,0 +1,4 @@
+project "myapp_with_deps" "0.1.0"
+entry   "src/main.lake"
+
+dep "demo-lib" "0.0.1" path "deps/demo-lib"

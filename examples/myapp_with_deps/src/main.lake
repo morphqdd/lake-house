@@ -1,0 +1,12 @@
+// Smoke project for lake-house dep injection.
+//
+// `lake.house` lists `dep "demo-lib" "0.0.1" path "deps/demo-lib"`,
+// so `house build` sets DEMO_LIB_PATH=<...>/deps/demo-lib before
+// invoking lakec, and the frontend's loader resolves the import
+// below through that env var (see lake-frontend/src/loader.rs).
+
++demo_lib.greet.{ hello }
+
+main is {
+  _ -> { hello() }
+}

@@ -1,0 +1,11 @@
+// Tiny dep providing a single helper.  Imported from the example
+// as `+demo_lib.greet.{ hello }` — `-` is normalised to `_` by
+// lake-frontend's module resolver (loader.rs SearchPaths).
+
++std.io.{ println }
+
+pub hello is {
+  _ -> {
+    println("hello from demo-lib!")
+  }
+}

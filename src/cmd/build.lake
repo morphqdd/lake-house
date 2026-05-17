@@ -12,7 +12,7 @@
 +std.experimental.fs.{ cstr_of }
 +std.experimental.process.{ run_envp }
 +std.io.{ print println eprintln print_buf println_buf }
-+manifest.{ dep_count dep_n_name dep_n_source dep_n_override manifest_registry_url }
++manifest.{ dep_count dep_n_name dep_n_source dep_n_override dep_n_kind manifest_registry_url DEP_PATH }
 +cache.{ lib_dir buf_concat }
 +cmd.install.{ install_dep }
 
@@ -93,9 +93,8 @@ build_env_entry is {
 // cache directory (`<HOME>/.lake/libs/<name>/<ref-or-ver>`).  For
 // git sources we strip the `git+url#` prefix to get the ref.
 resolve_dep_dir is {
-  name buf source buf override buf -> ret buf {
-    let on = size(override)
-    when on > 0 {
+  name buf source buf override buf kind i64 -> ret buf {
+    when kind == DEP_PATH {
       true  -> { ret override }
       false -> {
         let ver = ref_or_version(source)
@@ -214,12 +213,14 @@ fill_dep_env is {
         let name = dep_n_name(file flen i)
         let source = dep_n_source(file flen i)
         let override = dep_n_override(file flen i)
-        let ov_size = size(override)
-        when ov_size == 0 {
-          true  -> { pin install_dep(name source reg_url) }
-          false -> { }
+        let kind = dep_n_kind(file flen i)
+        // Kind drives the install path; size(override) is unreliable
+        // because alloc_or_die(0) returns a 16-byte zeroed buf.
+        when kind == DEP_PATH {
+          true  -> { }
+          false -> { pin install_dep(name source reg_url) }
         }
-        let dir = resolve_dep_dir(name source override)
+        let dir = resolve_dep_dir(name source override kind)
         let entry = build_env_entry(name dir)
         rt_store(slots addr(entry) 8 off)
         self(file flen ndeps i + 1 slots off + 8 reg_url)

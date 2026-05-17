@@ -614,6 +614,117 @@ find_registry_line is {
   }
 }
 
+// Is the line at `i` a `project ...` line?  7-byte prefix.
+is_project_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i + 8 > flen {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(f i)
+        let b1 = at(f i + 1)
+        let b2 = at(f i + 2)
+        let b3 = at(f i + 3)
+        let b4 = at(f i + 4)
+        let b5 = at(f i + 5)
+        let b6 = at(f i + 6)
+        let b7 = at(f i + 7)
+        when b0 == 112 {
+          true -> {
+            when b1 == 114 {
+              true -> {
+                when b2 == 111 {
+                  true -> {
+                    when b3 == 106 {
+                      true -> {
+                        when b4 == 101 {
+                          true -> {
+                            when b5 == 99 {
+                              true -> {
+                                when b6 == 116 {
+                                  true -> {
+                                    when b7 == 32 {
+                                      true  -> { ret 1 }
+                                      false -> {
+                                        when b7 == 9 {
+                                          true  -> { ret 1 }
+                                          false -> { ret 0 }
+                                        }
+                                      }
+                                    }
+                                  }
+                                  false -> { ret 0 }
+                                }
+                              }
+                              false -> { ret 0 }
+                            }
+                          }
+                          false -> { ret 0 }
+                        }
+                      }
+                      false -> { ret 0 }
+                    }
+                  }
+                  false -> { ret 0 }
+                }
+              }
+              false -> { ret 0 }
+            }
+          }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+find_project_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let is_p = is_project_line(f flen i)
+        when is_p == 1 {
+          true  -> { ret i }
+          false -> {
+            let ni = next_line(f flen i)
+            self(f flen ni)
+          }
+        }
+      }
+    }
+  }
+}
+
+// Extract the n-th quoted token from the `project` line.  Token 1
+// is name, token 2 is version.  Returns an empty buf if absent.
+project_token is {
+  file buf flen i64 tok i64 -> ret buf {
+    let line = find_project_line(file flen 0)
+    when line < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let packed = nth_token(file flen line tok)
+        when packed < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> { ret slice_packed(file packed) }
+        }
+      }
+    }
+  }
+}
+
+pub parse_project_name is {
+  file buf flen i64 -> ret buf {
+    ret project_token(file flen 1)
+  }
+}
+
+pub parse_project_version is {
+  file buf flen i64 -> ret buf {
+    ret project_token(file flen 2)
+  }
+}
+
 // `manifest_registry_url(file, flen)` — the `registry "<url>"`
 // value or an empty buf if absent.
 pub manifest_registry_url is {

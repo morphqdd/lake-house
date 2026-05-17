@@ -1,0 +1,217 @@
+// `install_dep(name, source)` — populate `~/.lake/libs/<name>/<ref>/`
+// from a dep source string.  Supported source shapes:
+//
+//     "0.1.0"                              semver — registry not yet wired
+//     "git+https://host/path#ref"          git clone --depth 1 --branch ref
+//
+// Path-override deps never reach here — the build dispatcher reads
+// the override directly and skips installation.
+//
+// See docs/state/features/082_house_deps.md (lake-native-compiler)
+
++std.bytes.{ size at }
++std.process.{ alloc_or_die }
++std.strings.{ concat_buf concat }
++std.experimental.process.{ run3 }
++std.experimental.fs.{ mkdir MODE_755 }
++std.io.{ print println eprintln print_buf println_buf }
++cache.{ lib_dir cache_root buf_concat is_installed }
+
+@rt(rt_copy_bytes)
+
+// Returns 1 iff `src[0..4] == "git+"`.
+is_git_source is {
+  src buf -> ret i64 {
+    let n = size(src)
+    when n < 4 {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(src 0)
+        let b1 = at(src 1)
+        let b2 = at(src 2)
+        let b3 = at(src 3)
+        when b0 == 103 {
+          true -> {
+            when b1 == 105 {
+              true -> {
+                when b2 == 116 {
+                  true -> {
+                    when b3 == 43 {
+                      true  -> { ret 1 }
+                      false -> { ret 0 }
+                    }
+                  }
+                  false -> { ret 0 }
+                }
+              }
+              false -> { ret 0 }
+            }
+          }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// Find the offset of `b` in `src` starting from `i`.  Returns -1
+// if not found.  Used to locate the `#` that separates url and ref
+// in a `git+...#ref` source.
+find_byte is {
+  src buf n i64 i i64 b i64 -> ret i64 {
+    when i >= n {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let c = at(src i)
+        when c == b {
+          true  -> { ret i }
+          false -> { self(src n i + 1 b) }
+        }
+      }
+    }
+  }
+}
+
+// Slice `src[lo..hi]` into a fresh buf.  Caller guarantees
+// `0 <= lo <= hi <= size(src)`.
+slice_range is {
+  src buf lo i64 hi i64 -> ret buf {
+    let n = hi - lo
+    let out = alloc_or_die(n)
+    rt_copy_bytes(out 0 src lo n)
+    ret out
+  }
+}
+
+// Extract the url part (after `git+` prefix, before `#`).
+git_url is {
+  src buf n i64 hash_at i64 -> ret buf {
+    ret slice_range(src 4 hash_at)
+  }
+}
+
+// Extract the ref part (after `#`).
+git_ref is {
+  src buf n i64 hash_at i64 -> ret buf {
+    ret slice_range(src hash_at + 1 n)
+  }
+}
+
+// `mkdir(path)` treating EEXIST as success.
+mkdir_p is {
+  path buf -> ret i64 {
+    let r = mkdir(path MODE_755)
+    when r.0 {
+      :ok -> { ret 0 }
+      :err -> {
+        when r.1 {
+          17 -> { ret 0 }
+          _  -> { ret 0 - 1 }
+        }
+      }
+    }
+  }
+}
+
+// Ensure parent dirs `<HOME>/.lake`, `<HOME>/.lake/libs`,
+// `<HOME>/.lake/libs/<name>` all exist.  Returns 0 on success,
+// -1 on any failure that is not EEXIST.
+ensure_parents is {
+  name buf -> ret i64 {
+    let root = cache_root()
+    let dot_lake = root
+    pin mkdir_p(dot_lake)
+    pin mkdir_p(root)
+    let with_slash = concat_buf(root "/")
+    let name_dir = buf_concat(with_slash name)
+    pin mkdir_p(name_dir)
+    ret 0
+  }
+}
+
+// `install_dep(name, source)` — top-level entry point.  Skips if
+// the cache entry already exists, otherwise dispatches by source
+// shape.  Returns 0 on success (including skipped), -1 on error.
+pub install_dep is {
+  name buf source buf -> ret i64 {
+    let is_git = is_git_source(source)
+    when is_git == 1 {
+      true  -> { ret install_git(name source) }
+      false -> {
+        eprintln("house: registry fetch not yet implemented")
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+// Git-source install path.  Parses `git+url#ref`, computes the
+// cache dir, mkdirs parents, runs `git clone --depth 1 --branch
+// <ref> <url> <dir>` via `/bin/sh -c` (multi-arg shell).
+install_git is {
+  name buf source buf -> ret i64 {
+    let n = size(source)
+    let hash_at = find_byte(source n 4 35)
+    when hash_at < 0 {
+      true  -> {
+        eprintln("house: malformed git source (missing #ref)")
+        ret 0 - 1
+      }
+      false -> {
+        let url = git_url(source n hash_at)
+        let ref = git_ref(source n hash_at)
+        let dir = lib_dir(name ref)
+        let cached = is_installed(dir)
+        when cached == 1 {
+          true -> {
+            print("[deps] cached ")
+            print_buf(name)
+            print("@")
+            println_buf(ref)
+            ret 0
+          }
+          false -> {
+            pin ensure_parents(name)
+            print("[deps] cloning ")
+            print_buf(name)
+            print("@")
+            println_buf(ref)
+            let cmd = build_clone_cmd(url ref dir)
+            let sh = concat("" "/bin/sh")
+            let dashc = concat("" "-c")
+            let r = run3(sh dashc cmd)
+            when r.0 {
+              :ok -> {
+                when r.1 {
+                  0 -> { ret 0 }
+                  _ -> {
+                    eprintln("[deps] git clone failed")
+                    ret 0 - 1
+                  }
+                }
+              }
+              _ -> {
+                eprintln("[deps] failed to spawn shell")
+                ret 0 - 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Build the shell command:
+//   git clone --depth 1 --branch <ref> <url> <dir>
+build_clone_cmd is {
+  url buf ref buf dir buf -> ret buf {
+    let p1 = concat("" "git clone --depth 1 --branch ")
+    let p2 = buf_concat(p1 ref)
+    let p3 = concat_buf(p2 " ")
+    let p4 = buf_concat(p3 url)
+    let p5 = concat_buf(p4 " ")
+    let p6 = buf_concat(p5 dir)
+    ret p6
+  }
+}

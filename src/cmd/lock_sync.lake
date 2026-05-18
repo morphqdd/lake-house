@@ -1,0 +1,222 @@
+// Install pipeline that consults lake.lock before falling back to
+// the registry resolver.  Captures each bare-version dep's resolved
+// (url, ref, sha) and rewrites lake.lock at the end.
+//
+// Path deps and git+ deps skip the lock entry — only registry-
+// resolved (bare-version) deps get pinned for now.
+
++std.bytes.{ size at }
++std.process.{ alloc_or_die }
++std.strings.{ concat concat_buf }
++std.experimental.process.{ run3 }
++std.io.{ print println eprintln print_buf println_buf }
++manifest.{ dep_n_name dep_n_source dep_n_kind parse_project_name parse_project_version DEP_GIT DEP_PATH }
++cache.{ lib_dir buf_concat is_installed }
++cmd.install.{ install_dep }
++cmd.lock.{ load_lock lock_lookup lock_url lock_ref lock_sha build_dep_line build_lock_body write_lock }
++cmd.git_capture.{ tmp_path git_capture_to_file read_file_trimmed }
+
+@rt(rt_copy_bytes)
+@rt(rt_store)
+
+// `git clone --depth 1 --branch <ref> <url> <dir>` via /bin/sh -c.
+// Mirrors install.lake's `install_git` clone command but takes the
+// (url, ref) pair directly (the lock has them pre-split).
+clone_pin is {
+  url buf ref buf dir buf -> ret i64 {
+    let p1 = concat("" "git clone --depth 1 --branch ")
+    let p2 = buf_concat(p1 ref)
+    let p3 = concat_buf(p2 " ")
+    let p4 = buf_concat(p3 url)
+    let p5 = concat_buf(p4 " ")
+    let p6 = buf_concat(p5 dir)
+    let sh = concat("" "/bin/sh")
+    let dashc = concat("" "-c")
+    let r = run3(sh dashc p6)
+    when r.0 {
+      :ok -> {
+        when r.1 {
+          0 -> { ret 0 }
+          _ -> {
+            eprintln("[deps] lock-pinned clone failed")
+            ret 0 - 1
+          }
+        }
+      }
+      _ -> {
+        eprintln("[deps] failed to spawn shell for pinned clone")
+        ret 0 - 1
+      }
+    }
+  }
+}
+
+// `head_sha(dir)` — capture `git -C <dir> rev-parse HEAD`.  Returns
+// empty buf on failure.
+pub head_sha is {
+  dir buf -> ret buf {
+    let stem = concat("" "sha")
+    let out = tmp_path(stem)
+    let p1 = concat("" "git -C ")
+    let p2 = buf_concat(p1 dir)
+    let p3 = concat_buf(p2 " rev-parse HEAD")
+    let rc = git_capture_to_file(p3 out)
+    when rc {
+      0 -> { ret read_file_trimmed(out) }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// Per-dep install + record.  Output: appends a `dep "..."` line to
+// `acc_blob` if the dep is bare (registry-resolved).  Non-bare deps
+// don't get pinned in the lock for now.
+//
+// State threaded through tail-calls:
+//   (file flen ndeps i acc reg_url lock_file lock_len)
+//
+// Returns the accumulated deps blob (one `dep ... \n` per bare dep).
+install_loop is {
+  file buf flen i64 ndeps i64 i i64 acc buf reg_url buf lock_file buf lock_len i64 -> ret buf {
+    when i >= ndeps {
+      true  -> { ret acc }
+      false -> {
+        let name = dep_n_name(file flen i)
+        let source = dep_n_source(file flen i)
+        let kind = dep_n_kind(file flen i)
+        let next_acc = install_one(name source kind reg_url lock_file lock_len acc)
+        self(file flen ndeps i + 1 next_acc reg_url lock_file lock_len)
+      }
+    }
+  }
+}
+
+// Install one dep.  For bare deps, prefer lock-pinned clone; else
+// fall back to registry resolver.  Returns the (possibly extended)
+// deps blob for the lock writer.
+install_one is {
+  name buf source buf kind i64 reg_url buf lock_file buf lock_len i64 acc buf -> ret buf {
+    when kind == DEP_PATH {
+      true  -> { ret acc }
+      false -> {
+        when kind == DEP_GIT {
+          true  -> {
+            pin install_dep(name source reg_url)
+            ret acc
+          }
+          false -> { ret install_bare(name source reg_url lock_file lock_len acc) }
+        }
+      }
+    }
+  }
+}
+
+// `install_bare` — registry-resolved dep with full lock-aware path.
+// `source` is the semver string (e.g. "0.1.0").
+install_bare is {
+  name buf ver buf reg_url buf lock_file buf lock_len i64 acc buf -> ret buf {
+    let dir = lib_dir(name ver)
+    let hit = lock_lookup(lock_file lock_len name ver)
+    when hit == 1 {
+      true  -> { ret install_bare_with_lock(name ver dir lock_file lock_len acc) }
+      false -> { ret install_bare_no_lock(name ver dir reg_url acc) }
+    }
+  }
+}
+
+// Lock has us — clone the pinned url@ref if needed, capture sha
+// (prefer the lock's recorded sha for the dep line), append dep
+// line to the lock-write accumulator.
+install_bare_with_lock is {
+  name buf ver buf dir buf lock_file buf lock_len i64 acc buf -> ret buf {
+    let url = lock_url(lock_file lock_len name ver)
+    let ref = lock_ref(lock_file lock_len name ver)
+    let sha = lock_sha(lock_file lock_len name ver)
+    let cached = is_installed(dir)
+    when cached == 1 {
+      true -> {
+        print("[deps] cached ")
+        print_buf(name)
+        print("@")
+        println_buf(ver)
+      }
+      false -> {
+        print("[deps] lock-pinned clone ")
+        print_buf(name)
+        print("@")
+        print_buf(ver)
+        print(" (")
+        print_buf(ref)
+        println(")")
+        pin clone_pin(url ref dir)
+      }
+    }
+    let line = build_dep_line(name ver url ref sha)
+    ret buf_concat(acc line)
+  }
+}
+
+// No lock entry — fall through to the registry resolver, then
+// capture the HEAD sha for the lock.
+install_bare_no_lock is {
+  name buf ver buf dir buf reg_url buf acc buf -> ret buf {
+    pin install_dep(name ver reg_url)
+    let sha = head_sha(dir)
+    let url = read_origin_url(dir)
+    let ref = ver
+    let line = build_dep_line(name ver url ref sha)
+    ret buf_concat(acc line)
+  }
+}
+
+// `git -C <dir> config --get remote.origin.url` — used as a best-
+// effort URL recovery when we don't have the lock's original.  In
+// practice this matches the registry's `git "..."` field.
+read_origin_url is {
+  dir buf -> ret buf {
+    let stem = concat("" "url")
+    let out = tmp_path(stem)
+    let p1 = concat("" "git -C ")
+    let p2 = buf_concat(p1 dir)
+    let p3 = concat_buf(p2 " config --get remote.origin.url")
+    let rc = git_capture_to_file(p3 out)
+    when rc {
+      0 -> { ret read_file_trimmed(out) }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// `sync_with_lock(file flen ndeps reg_url)` — run the install loop,
+// then write lake.lock.  Returns 0 on success, -1 if the loop or
+// lock-write errored (best-effort lock; a write failure is logged
+// but doesn't abort the build).
+pub sync_with_lock is {
+  file buf flen i64 ndeps i64 reg_url buf -> ret i64 {
+    let lock_path = concat("" "lake.lock")
+    let lock_file = load_lock(lock_path)
+    let lock_len = size(lock_file)
+    let empty = alloc_or_die(0)
+    let blob = install_loop(file flen ndeps 0 empty reg_url lock_file lock_len)
+    let bn = size(blob)
+    when bn == 0 {
+      true  -> { ret 0 }
+      false -> {
+        let proj_name = parse_project_name(file flen)
+        let proj_ver = parse_project_version(file flen)
+        let body = build_lock_body(proj_name proj_ver blob)
+        let w = write_lock(lock_path body)
+        when w {
+          0 -> {
+            println("[deps] lake.lock updated")
+            ret 0
+          }
+          _ -> {
+            eprintln("[deps] failed to write lake.lock")
+            ret 0
+          }
+        }
+      }
+    }
+  }
+}

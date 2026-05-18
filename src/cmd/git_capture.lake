@@ -1,0 +1,213 @@
+// Capture stdout of a shell command into a tempfile, then read it
+// back as a buf.  Workaround for run3 inheriting parent stdio.
+//
+// See docs/state/features/082_house_deps.md (lake-native-compiler)
+
++std.bytes.{ size at trim }
++std.process.{ alloc_or_die }
++std.strings.{ concat concat_buf }
++std.experimental.fs.{ open close_file read }
++std.experimental.sys.{ O_RDONLY getpid }
++std.experimental.process.{ run3 }
++std.io.{ eprintln }
++cache.{ buf_concat }
+
+@rt(rt_copy_bytes)
+@rt(rt_store)
+
+const CAP_MAX = 4096
+
+// Render an unsigned i64 as decimal ASCII into a fresh buf.
+itoa_dec is {
+  n i64 -> ret buf {
+    when n == 0 {
+      true  -> {
+        let z = alloc_or_die(1)
+        rt_store(z 48 1 0)
+        ret z
+      }
+      false -> { ret itoa_loop(n) }
+    }
+  }
+}
+
+// Count decimal digits of `n` (`n > 0`).
+digit_count is {
+  n i64 acc i64 -> ret i64 {
+    when n == 0 {
+      true  -> { ret acc }
+      false -> { self(n / 10 acc + 1) }
+    }
+  }
+}
+
+// Write digits right-to-left into `out[0..dc]`.
+fill_digits is {
+  out buf n i64 i i64 -> ret i64 {
+    when n == 0 {
+      true  -> { ret 0 }
+      false -> {
+        let d = n - n / 10 * 10
+        rt_store(out 48 + d 1 i - 1)
+        self(out n / 10 i - 1)
+      }
+    }
+  }
+}
+
+itoa_loop is {
+  n i64 -> ret buf {
+    let dc = digit_count(n 0)
+    let out = alloc_or_die(dc)
+    pin fill_digits(out n dc)
+    ret out
+  }
+}
+
+// `tmp_path(stem)` — `/tmp/lake-house-<stem>-<pid>`.
+pub tmp_path is {
+  stem buf -> ret buf {
+    let p1 = concat("" "/tmp/lake-house-")
+    let p2 = buf_concat(p1 stem)
+    let p3 = concat_buf(p2 "-")
+    let pid = getpid()
+    let pidb = itoa_dec(pid)
+    ret buf_concat(p3 pidb)
+  }
+}
+
+// Wrap `<cmd> > <out_path>` as `/bin/sh -c "<cmd> > <out_path>"`.
+// Returns the wait4 exit code on success, -1 on spawn failure.
+pub git_capture_to_file is {
+  cmd buf out_path buf -> ret i64 {
+    let p = concat_buf(cmd " > ")
+    let q = buf_concat(p out_path)
+    let sh = concat("" "/bin/sh")
+    let dashc = concat("" "-c")
+    let r = run3(sh dashc q)
+    when r.0 {
+      :ok -> { ret r.1 }
+      _   -> { ret 0 - 1 }
+    }
+  }
+}
+
+// Read `path` into a fresh buf and trim trailing whitespace /
+// newline.  Returns empty buf on any failure.
+pub read_file_trimmed is {
+  path buf -> ret buf {
+    let or = open(path O_RDONLY 0)
+    when or.0 {
+      :ok -> {
+        let fd = or.1
+        let payload = alloc_or_die(CAP_MAX)
+        let rr = read(fd payload CAP_MAX)
+        close_file(fd)
+        when rr.0 {
+          :ok -> {
+            let n = rr.1
+            let trimmed = trim_tail(payload n)
+            ret trimmed
+          }
+          _ -> { ret alloc_or_die(0) }
+        }
+      }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// Trim trailing `\n` / `\r` / space / tab; return a fresh exact-size
+// buf.  Lake's `trim` is in-place and only NUL-pads; we need a
+// shrunk buf so size() reports the real length.
+trim_tail is {
+  src buf n i64 -> ret buf {
+    let end = trim_tail_scan(src n)
+    let out = alloc_or_die(end)
+    rt_copy_bytes(out 0 src 0 end)
+    ret out
+  }
+}
+
+trim_tail_scan is {
+  src buf n i64 -> ret i64 {
+    when n == 0 {
+      true  -> { ret 0 }
+      false -> {
+        let b = at(src n - 1)
+        when b == 10 {
+          true  -> { self(src n - 1) }
+          false -> {
+            when b == 13 {
+              true  -> { self(src n - 1) }
+              false -> {
+                when b == 32 {
+                  true  -> { self(src n - 1) }
+                  false -> {
+                    when b == 9 {
+                      true  -> { self(src n - 1) }
+                      false -> {
+                        when b == 0 {
+                          true  -> { self(src n - 1) }
+                          false -> { ret n }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// `git_origin_url()` — capture `git -C . config --get remote.origin.url`.
+// Returns trimmed url buf, empty on failure.
+pub git_origin_url is {
+  _ -> ret buf {
+    let stem = concat("" "origin")
+    let out = tmp_path(stem)
+    let cmd = concat("" "git -C . config --get remote.origin.url")
+    let rc = git_capture_to_file(cmd out)
+    when rc {
+      0 -> { ret read_file_trimmed(out) }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}
+
+// `git_head_ref()` — prefer `describe --tags --exact-match`, else
+// `rev-parse HEAD`.  Trimmed buf, empty on total failure.
+pub git_head_ref is {
+  _ -> ret buf {
+    let stem = concat("" "ref")
+    let out = tmp_path(stem)
+    let cmd = concat("" "git -C . describe --tags --exact-match 2>/dev/null")
+    let rc = git_capture_to_file(cmd out)
+    when rc {
+      0 -> {
+        let tag = read_file_trimmed(out)
+        let tn = size(tag)
+        when tn > 0 {
+          true  -> { ret tag }
+          false -> { ret rev_parse_head(out) }
+        }
+      }
+      _ -> { ret rev_parse_head(out) }
+    }
+  }
+}
+
+rev_parse_head is {
+  out buf -> ret buf {
+    let cmd = concat("" "git -C . rev-parse HEAD")
+    let rc = git_capture_to_file(cmd out)
+    when rc {
+      0 -> { ret read_file_trimmed(out) }
+      _ -> { ret alloc_or_die(0) }
+    }
+  }
+}

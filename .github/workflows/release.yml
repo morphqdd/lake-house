@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust stable + mold
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update && sudo apt-get install -y mold
+
+      - name: fetch latest lakec release
+        run: |
+          set -e
+          API="https://api.github.com/repos/morphqdd/lake-native-compiler/releases/latest"
+          URL="$(curl -fsSL $API | grep -m1 browser_download_url | sed -E 's/.*"([^"]+)".*/\1/')"
+          curl -fsSL "$URL" -o lakec.tgz
+          mkdir -p lakec-dist
+          tar -xzf lakec.tgz -C lakec-dist
+          echo "LAKEC=$(pwd)/lakec-dist/lakec" >> "$GITHUB_ENV"
+
+      - name: fetch latest stdlib release
+        run: |
+          set -e
+          API="https://api.github.com/repos/morphqdd/lake-stdlib/releases/latest"
+          URL="$(curl -fsSL $API | grep -m1 browser_download_url | sed -E 's/.*"([^"]+)".*/\1/')"
+          curl -fsSL "$URL" -o stdlib.tgz
+          mkdir -p stdlib-dist
+          tar -xzf stdlib.tgz -C stdlib-dist
+          echo "LAKE_PATH=$(pwd)/stdlib-dist" >> "$GITHUB_ENV"
+
+      - name: build house
+        run: |
+          chmod +x "$LAKEC"
+          "$LAKEC" src/main.lake
+
+      - name: pack
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          install -m 0755 src/build/main dist/house
+          tar -czf "house-${VER}-linux-x86_64.tar.gz" -C dist house
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: house-*-linux-x86_64.tar.gz
+          fail_on_unmatched_files: true

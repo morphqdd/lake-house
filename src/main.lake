@@ -26,6 +26,7 @@ usage is {
     println("  house new <name>   scaffold a new project")
     println("  house build        build via lakec")
     println("  house run          build + execute")
+    println("  house test         build + run tests/main.lake")
     println("  house publish      append current pkg to registry")
     println("  house add <pkg> <ver>  resolve + pin a registry dep")
     println("  house help         show this message")
@@ -131,6 +132,51 @@ cmd_build is {
   _ -> { pin build_with_deps(0) }
 }
 
+// `house test` — compile the project's `tests/main.lake` (reusing the
+// dep + env + flag build pipeline) and run it.  Exit code 0 = pass,
+// non-zero = fail (the test binary signals failure by exiting non-zero,
+// e.g. via `std.panic.assert` / `panic`).
+cmd_test is {
+  _ -> {
+    let path = concat("" "lake.house")
+    let m = load(path)
+    let mlen = size(m)
+    let ndeps = dep_count(m mlen)
+    let entry = concat("" "tests/main.lake")
+    print("[test] building ")
+    println_buf(entry)
+    let code = spawn_lakec(entry m mlen ndeps)
+    when code {
+      0 -> {
+        let bin = concat("" "tests/build/main")
+        print("[test] running ")
+        println_buf(bin)
+        let empty = concat("" "")
+        let rr = run(bin empty)
+        when rr.0 {
+          :ok -> {
+            when rr.1 {
+              0 -> { println("[test] PASS") }
+              _ -> {
+                eprintln("[test] FAIL — test binary exited non-zero")
+                pin exit(1)
+              }
+            }
+          }
+          _ -> {
+            eprintln("[test] failed to spawn test binary")
+            pin exit(1)
+          }
+        }
+      }
+      _ -> {
+        eprintln("[test] build failed")
+        pin exit(1)
+      }
+    }
+  }
+}
+
 cmd_run is {
   _ -> {
     let code = build_with_deps(0)
@@ -164,6 +210,7 @@ dispatch_cmd is {
       "help"    -> { usage() }
       "build"   -> { cmd_build() }
       "run"     -> { cmd_run() }
+      "test"    -> { cmd_test() }
       "new"     -> { dispatch_new() }
       "publish" -> { pin publish_current(0) }
       "add"     -> { dispatch_add() }

@@ -18,6 +18,10 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 root="$(cd "$here/.." && pwd)"
 LAKEC="${LAKEC:-$root/lake-native-compiler/target/release/lakec}"
 export LAKE_PATH="${LAKE_PATH:-$root/lake-stdlib}"
+# house reads these to locate the toolchain (resolve_lakec / resolve_stdlib);
+# exporting them keeps the spawned lakec on the same stdlib as this script.
+export LAKEC
+export LAKE_STDLIB="${LAKE_STDLIB:-$LAKE_PATH}"
 
 [ -x "$LAKEC" ] || { echo "FAIL: lakec not found at $LAKEC"; exit 1; }
 
@@ -82,5 +86,39 @@ HOUSE
 run_house build >/dev/null 2>&1 || fail "build with env line failed"
 "$proj/src/build/main" | grep -q "fixture ok" || fail "env-build binary did not run"
 pass "manifest env line builds cleanly"
+
+# ── 4. house test — passing + failing ────────────────────────────
+cat > "$proj/lake.house" <<'HOUSE'
+project "fixture" "0.1.0"
+entry "src/main.lake"
+HOUSE
+mkdir -p "$proj/tests"
+cat > "$proj/tests/main.lake" <<'LAKE'
++std.io.{ println }
++std.panic.{ assert }
+main is {
+  _ -> {
+    pin assert(1 + 1 == 2 "math works")
+    println("[ok] tests passed")
+  }
+}
+LAKE
+run_house test >/dev/null 2>&1 || fail "house test (passing) should exit 0"
+pass "house test — passing suite exits 0"
+
+cat > "$proj/tests/main.lake" <<'LAKE'
++std.io.{ println }
++std.panic.{ assert }
+main is {
+  _ -> {
+    pin assert(1 + 1 == 3 "math is broken")
+    println("[ok] unreachable")
+  }
+}
+LAKE
+if run_house test >/dev/null 2>&1; then
+  fail "house test (failing) should exit non-zero"
+fi
+pass "house test — failing suite exits non-zero"
 
 echo "ALL PASS"

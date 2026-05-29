@@ -12,6 +12,7 @@ commands ship as new source files compiled into the binary.
 | `house new <name>`      | scaffold a new project directory             |
 | `house build`           | install deps + run `lakec` on `entry`        |
 | `house run`             | `build` + exec the produced binary           |
+| `house test`            | build + run `tests/main.lake` (exit 0 = pass)|
 | `house publish`         | open a fork+PR against the registry          |
 | `house add <pkg> <ver>` | resolve + pin a registry dep into the project|
 | `house help`            | print usage                                  |

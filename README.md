@@ -27,10 +27,25 @@ entry   "src/main.lake"
 dep "lake-rails" "0.1.0"
 dep "marine"     "git+https://github.com/morphqdd/marine#dev"
 dep "lash"       "0.2.0" path "/abs/path/to/lash"
+
+env  "DATABASE_URL" "postgres://localhost/dev"
+flag "--release"
 ```
 
 Parsed by `house` directly — no Lake-eval round-trip; the file is
 *Lake-flavoured* but read as ASCII tokens.
+
+### `env` and `flag` lines
+
+| line                  | effect                                                  |
+|-----------------------|---------------------------------------------------------|
+| `env "KEY" "VALUE"`   | injected into the spawned `lakec`'s environment as `KEY=VALUE` |
+| `flag "<arg>"`        | appended to the `lakec` CLI argv (one token per line)   |
+
+`env` entries join the auto-injected `<LIBNAME>_PATH` dep roots and
+`LAKE_PATH` in the child envp.  `flag` lines pass compiler options
+through — e.g. `flag "--release"` builds in release mode, `flag "-O"`
++ `flag "speed"` sets the opt level (each token is a separate line).
 
 ### Dep source shapes
 

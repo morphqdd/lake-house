@@ -34,10 +34,25 @@ Dep is {
   ovr  buf
 }
 
-// A parsed `lake.house` manifest.  `deps` is empty for a leaf project.
+// One `env "KEY" "VALUE"` line — an environment variable injected into
+// the spawned `lakec` (and the built binary under `house run`).
+EnvVar is {
+  key buf
+  val buf
+}
+
+// A parsed `lake.house` manifest.
+//
+//   deps  — `dep  "<name>" "<ver>" [path "<dir>"]`
+//   envs  — `env  "<KEY>"  "<VALUE>"`        (passed through to lakec)
+//   flags — `flag "<arg>"`                   (extra lakec CLI args)
+//
+// All three are empty for a bare leaf project.
 Manifest is {
   name    buf
   version buf
   entry   buf
   deps    Vec[Dep]
+  envs    Vec[EnvVar]
+  flags   Vec[buf]
 }

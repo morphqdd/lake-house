@@ -10,9 +10,9 @@
 +std.process.{ alloc_or_die }
 +std.strings.{ concat concat_buf }
 +std.experimental.fs.{ cstr_of }
-+std.experimental.process.{ run_envp }
++std.experimental.process.{ run_envp run_envp_argv }
 +std.io.{ print println eprintln print_buf println_buf }
-+manifest.{ dep_count dep_n_name dep_n_source dep_n_override dep_n_kind manifest_registry_url DEP_PATH }
++manifest.{ dep_count dep_n_name dep_n_source dep_n_override dep_n_kind manifest_registry_url DEP_PATH env_count env_n_key env_n_val flag_count flag_n }
 +cache.{ lib_dir buf_concat }
 +cmd.lock_sync.{ sync_with_lock }
 
@@ -224,9 +224,43 @@ fill_dep_env is {
   }
 }
 
-// Assemble final envp:  existing envp pointers ++ dep env entries
-// ++ LAKE_PATH override ++ NUL.  Returns the envp buf so the
-// caller can pass `addr(envp_buf)` to `run_envp`.
+// Build a `KEY=VALUE\0` cstring buf for a manifest `env` line.  Buf-
+// native (size + rt_copy_bytes) so it works on the heap bufs returned
+// by `env_n_key` / `env_n_val`.  '=' = 61, NUL = 0.
+build_env_entry_kv is {
+  key buf val buf -> ret buf {
+    let kn = size(key)
+    let vn = size(val)
+    let total = kn + vn + 2
+    let out = alloc_or_die(total)
+    rt_copy_bytes(out 0 key 0 kn)
+    rt_store(out 61 1 kn)
+    rt_copy_bytes(out kn + 1 val 0 vn)
+    rt_store(out 0 1 kn + 1 + vn)
+    ret out
+  }
+}
+
+// Append each manifest `env "K" "V"` entry's `K=V\0` pointer into
+// `slots[off..]`.  Mirrors `fill_dep_env`.
+fill_manifest_env is {
+  file buf flen i64 nenvs i64 i i64 slots buf off i64 -> ret i64 {
+    when i >= nenvs {
+      true  -> { ret off }
+      false -> {
+        let k = env_n_key(file flen i)
+        let v = env_n_val(file flen i)
+        let entry = build_env_entry_kv(k v)
+        rt_store(slots addr(entry) 8 off)
+        self(file flen nenvs i + 1 slots off + 8)
+      }
+    }
+  }
+}
+
+// Assemble final envp:  existing envp pointers ++ dep `<LIB>_PATH`
+// entries ++ manifest `env` entries ++ LAKE_PATH override ++ NUL.
+// Returns the envp buf so the caller can pass `addr(envp_buf)`.
 //
 // Install pipeline (lock-aware) runs in `sync_with_lock` before
 // envp assembly so the cache dirs are guaranteed populated when
@@ -237,24 +271,60 @@ pub build_envp is {
     pin sync_with_lock(file flen ndeps reg_url)
     let base = rt_envp_raw()
     let existing = count_envp(base 0)
-    // total slots: existing + ndeps + 1 (LAKE_PATH) + 1 (NUL)
-    let total_slots = existing + ndeps + 2
+    let nenvs = env_count(file flen)
+    // slots: existing + ndeps + nenvs + 1 (LAKE_PATH) + 1 (NUL)
+    let total_slots = existing + ndeps + nenvs + 2
     let envp = alloc_or_die(total_slots * 8)
     pin copy_env_ptrs(envp base 0 existing)
     let post_dep = fill_dep_env(file flen ndeps 0 envp existing * 8)
+    let post_env = fill_manifest_env(file flen nenvs 0 envp post_dep)
     let lake_cstr = cstr_of(concat("" "LAKE_PATH=/home/morphe/compiler/lake-stdlib"))
-    rt_store(envp addr(lake_cstr) 8 post_dep)
-    rt_store(envp 0 8 post_dep + 8)
+    rt_store(envp addr(lake_cstr) 8 post_env)
+    rt_store(envp 0 8 post_env + 8)
     ret envp
   }
 }
 
-// Entry point used by `cmd_build` / `cmd_run` in main.lake.
+// Append each manifest `flag "<arg>"` cstring pointer into
+// `slots[off..]`.
+fill_flags_argv is {
+  file buf flen i64 nflags i64 i i64 slots buf off i64 -> ret i64 {
+    when i >= nflags {
+      true  -> { ret off }
+      false -> {
+        let a = flag_n(file flen i)
+        let ca = cstr_of(a)
+        rt_store(slots addr(ca) 8 off)
+        self(file flen nflags i + 1 slots off + 8)
+      }
+    }
+  }
+}
+
+// Build the lakec argv: `[lakec, entry, <flags...>, NULL]`.
+build_lakec_argv is {
+  lakec_cstr buf entry_cstr buf file buf flen i64 nflags i64 -> ret buf {
+    let total = nflags + 3
+    let av = alloc_or_die(total * 8)
+    rt_store(av addr(lakec_cstr) 8 0)
+    rt_store(av addr(entry_cstr) 8 8)
+    let post = fill_flags_argv(file flen nflags 0 av 16)
+    rt_store(av 0 8 post)
+    ret av
+  }
+}
+
+// Entry point used by `cmd_build` / `cmd_run` in main.lake.  Passes
+// any manifest `flag` lines through to lakec's CLI.
 pub spawn_lakec is {
   entry buf file buf flen i64 ndeps i64 -> ret i64 {
     let envp = build_envp(file flen ndeps)
     let lakec = concat("" "/home/morphe/compiler/lake-native-compiler/target/release/lakec")
-    let r = run_envp(lakec entry addr(envp))
+    let nflags = flag_count(file flen)
+    let lakec_cstr = cstr_of(lakec)
+    let entry_cstr = cstr_of(entry)
+    let argv = build_lakec_argv(lakec_cstr entry_cstr file flen nflags)
+    let r = run_envp_argv(lakec addr(argv) addr(envp))
     when r.0 {
       :ok -> {
         when r.1 {

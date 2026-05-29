@@ -16,7 +16,7 @@
 +std.bytes.{ at trim size }
 +std.io.{ eprintln print }
 +std.vec.{ vec_new vec_push }
-+types.{ Manifest Dep DepSource }
++types.{ Manifest Dep DepSource EnvVar }
 
 @rt(rt_copy_bytes)
 
@@ -61,16 +61,52 @@ collect_deps is {
   }
 }
 
+// Recursively collect env vars [n, total) into `acc`.
+collect_envs is {
+  file buf flen i64 n i64 total i64 acc Vec[EnvVar] -> ret Vec[EnvVar] {
+    when n >= total {
+      true -> { ret acc }
+      false -> {
+        let k = env_n_key(file flen n)
+        let v = env_n_val(file flen n)
+        let e EnvVar = EnvVar(k v)
+        let acc2 = vec_push(acc e)
+        ret collect_envs(file flen n + 1 total acc2)
+      }
+    }
+  }
+}
+
+// Recursively collect flag args [n, total) into `acc`.
+collect_flags is {
+  file buf flen i64 n i64 total i64 acc Vec[buf] -> ret Vec[buf] {
+    when n >= total {
+      true -> { ret acc }
+      false -> {
+        let a = flag_n(file flen n)
+        let acc2 = vec_push(acc a)
+        ret collect_flags(file flen n + 1 total acc2)
+      }
+    }
+  }
+}
+
 // Parse a loaded manifest buffer into a `Manifest` record.
 pub parse is {
   file buf flen i64 -> ret Manifest {
     let nm = parse_project_name(file flen)
     let vr = parse_project_version(file flen)
     let en = parse_entry(file flen)
-    let total = dep_count(file flen)
+    let dtotal = dep_count(file flen)
     let d0 Vec[Dep] = vec_new()
-    let deps = collect_deps(file flen 0 total d0)
-    let m Manifest = Manifest(nm vr en deps)
+    let deps = collect_deps(file flen 0 dtotal d0)
+    let etotal = env_count(file flen)
+    let e0 Vec[EnvVar] = vec_new()
+    let envs = collect_envs(file flen 0 etotal e0)
+    let ftotal = flag_count(file flen)
+    let f0 Vec[buf] = vec_new()
+    let flags = collect_flags(file flen 0 ftotal f0)
+    let m Manifest = Manifest(nm vr en deps envs flags)
     ret m
   }
 }
@@ -571,6 +607,183 @@ kind_from_source is {
             }
           }
           false -> { ret DEP_BARE }
+        }
+      }
+    }
+  }
+}
+
+// ── env / flag lines (#97) ──────────────────────────────────────
+//
+//   env  "<KEY>" "<VALUE>"   — passed into the spawned lakec's envp
+//   flag "<arg>"             — appended to the lakec CLI argv
+//
+// Same byte-prefix line classification + `nth_token` extraction as
+// `dep` lines.
+
+// True when line at `i` begins with `env` followed by a separator.
+is_env_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i + 4 > flen {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(f i)
+        let b1 = at(f i + 1)
+        let b2 = at(f i + 2)
+        let b3 = at(f i + 3)
+        when b0 == 101 {
+          true -> { when b1 == 110 {
+            true -> { when b2 == 118 {
+              true -> { when b3 == 32 {
+                true  -> { ret 1 }
+                false -> { when b3 == 9 { true -> { ret 1 } false -> { ret 0 } } }
+              } }
+              false -> { ret 0 } } }
+            false -> { ret 0 } } }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+// True when line at `i` begins with `flag` followed by a separator.
+is_flag_line is {
+  f buf flen i64 i i64 -> ret i64 {
+    when i + 5 > flen {
+      true  -> { ret 0 }
+      false -> {
+        let b0 = at(f i)
+        let b1 = at(f i + 1)
+        let b2 = at(f i + 2)
+        let b3 = at(f i + 3)
+        let b4 = at(f i + 4)
+        when b0 == 102 {
+          true -> { when b1 == 108 {
+            true -> { when b2 == 97 {
+              true -> { when b3 == 103 {
+                true -> { when b4 == 32 {
+                  true  -> { ret 1 }
+                  false -> { when b4 == 9 { true -> { ret 1 } false -> { ret 0 } } }
+                } }
+                false -> { ret 0 } } }
+              false -> { ret 0 } } }
+            false -> { ret 0 } } }
+          false -> { ret 0 }
+        }
+      }
+    }
+  }
+}
+
+env_count_at is {
+  f buf flen i64 i i64 acc i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret acc }
+      false -> {
+        let is_env = is_env_line(f flen i)
+        let ni = next_line(f flen i)
+        when is_env == 1 {
+          true  -> { self(f flen ni acc + 1) }
+          false -> { self(f flen ni acc) }
+        }
+      }
+    }
+  }
+}
+
+pub env_count is {
+  file buf flen i64 -> ret i64 { ret env_count_at(file flen 0 0) }
+}
+
+flag_count_at is {
+  f buf flen i64 i i64 acc i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret acc }
+      false -> {
+        let is_flag = is_flag_line(f flen i)
+        let ni = next_line(f flen i)
+        when is_flag == 1 {
+          true  -> { self(f flen ni acc + 1) }
+          false -> { self(f flen ni acc) }
+        }
+      }
+    }
+  }
+}
+
+pub flag_count is {
+  file buf flen i64 -> ret i64 { ret flag_count_at(file flen 0 0) }
+}
+
+// Offset of the `n`-th env line, or -1.
+env_line_at is {
+  f buf flen i64 i i64 n i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let is_env = is_env_line(f flen i)
+        let ni = next_line(f flen i)
+        when is_env == 1 {
+          true -> { when n == 0 { true -> { ret i } false -> { self(f flen ni n - 1) } } }
+          false -> { self(f flen ni n) }
+        }
+      }
+    }
+  }
+}
+
+flag_line_at is {
+  f buf flen i64 i i64 n i64 -> ret i64 {
+    when i >= flen {
+      true  -> { ret 0 - 1 }
+      false -> {
+        let is_flag = is_flag_line(f flen i)
+        let ni = next_line(f flen i)
+        when is_flag == 1 {
+          true -> { when n == 0 { true -> { ret i } false -> { self(f flen ni n - 1) } } }
+          false -> { self(f flen ni n) }
+        }
+      }
+    }
+  }
+}
+
+env_n_token is {
+  file buf flen i64 n i64 tok i64 -> ret buf {
+    let line = env_line_at(file flen 0 n)
+    when line < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let packed = nth_token(file flen line tok)
+        when packed < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> { ret slice_packed(file packed) }
+        }
+      }
+    }
+  }
+}
+
+// `env_n_key` = token 1, `env_n_val` = token 2 of the n-th env line.
+pub env_n_key is {
+  file buf flen i64 n i64 -> ret buf { ret env_n_token(file flen n 1) }
+}
+pub env_n_val is {
+  file buf flen i64 n i64 -> ret buf { ret env_n_token(file flen n 2) }
+}
+
+// `flag_n` = token 1 of the n-th flag line.
+pub flag_n is {
+  file buf flen i64 n i64 -> ret buf {
+    let line = flag_line_at(file flen 0 n)
+    when line < 0 {
+      true  -> { ret alloc_or_die(0) }
+      false -> {
+        let packed = nth_token(file flen line 1)
+        when packed < 0 {
+          true  -> { ret alloc_or_die(0) }
+          false -> { ret slice_packed(file packed) }
         }
       }
     }

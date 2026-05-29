@@ -1,0 +1,41 @@
+name: test
+
+on:
+  push:
+    branches: [ master, dev ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust stable + mold
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update && sudo apt-get install -y mold
+
+      - name: fetch latest lakec release
+        run: |
+          set -e
+          API="https://api.github.com/repos/morphqdd/lake-native-compiler/releases/latest"
+          URL="$(curl -fsSL $API | grep -m1 browser_download_url | sed -E 's/.*"([^"]+)".*/\1/')"
+          curl -fsSL "$URL" -o lakec.tgz
+          mkdir -p lakec-dist
+          tar -xzf lakec.tgz -C lakec-dist
+          echo "LAKEC=$(pwd)/lakec-dist/lakec" >> "$GITHUB_ENV"
+
+      - name: fetch latest stdlib release
+        run: |
+          set -e
+          API="https://api.github.com/repos/morphqdd/lake-stdlib/releases/latest"
+          URL="$(curl -fsSL $API | grep -m1 browser_download_url | sed -E 's/.*"([^"]+)".*/\1/')"
+          curl -fsSL "$URL" -o stdlib.tgz
+          mkdir -p stdlib-dist
+          tar -xzf stdlib.tgz -C stdlib-dist
+          echo "LAKE_PATH=$(pwd)/stdlib-dist" >> "$GITHUB_ENV"
+
+      - name: build + env/flag integration test
+        run: bash tests/build_env_flag.sh

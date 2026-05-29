@@ -15,10 +15,65 @@
 +std.process.{ alloc_or_die die }
 +std.bytes.{ at trim size }
 +std.io.{ eprintln print }
++std.vec.{ vec_new vec_push }
++types.{ Manifest Dep DepSource }
 
 @rt(rt_copy_bytes)
 
 const MAX_MANIFEST = 4096
+
+// ── modern record API (#97) ─────────────────────────────────────
+//
+// `parse(file, flen)` builds a `Manifest` record (name / version /
+// entry / Vec[Dep]) on top of the low-level scanners below.  New code
+// should consume the record; the per-token accessors (`dep_n_*`) stay
+// for the scanners' internal use and back-compat.
+
+// Map the legacy i64 kind code (DEP_BARE / DEP_GIT / DEP_PATH) to the
+// `DepSource` enum.
+dep_source_of is {
+  k i64 -> ret DepSource {
+    when k {
+      1 -> { ret DepSource.Git }
+      2 -> { ret DepSource.Path }
+      _ -> { ret DepSource.Registry }
+    }
+  }
+}
+
+// Recursively collect deps [n, total) into `acc`.  Each `Dep` is bound
+// to a typed `let` (bug #157 workaround) before being pushed.
+collect_deps is {
+  file buf flen i64 n i64 total i64 acc Vec[Dep] -> ret Vec[Dep] {
+    when n >= total {
+      true -> { ret acc }
+      false -> {
+        let nm = dep_n_name(file flen n)
+        let vr = dep_n_source(file flen n)
+        let k = dep_n_kind(file flen n)
+        let s DepSource = dep_source_of(k)
+        let ov = dep_n_override(file flen n)
+        let d Dep = Dep(nm vr s ov)
+        let acc2 = vec_push(acc d)
+        ret collect_deps(file flen n + 1 total acc2)
+      }
+    }
+  }
+}
+
+// Parse a loaded manifest buffer into a `Manifest` record.
+pub parse is {
+  file buf flen i64 -> ret Manifest {
+    let nm = parse_project_name(file flen)
+    let vr = parse_project_version(file flen)
+    let en = parse_entry(file flen)
+    let total = dep_count(file flen)
+    let d0 Vec[Dep] = vec_new()
+    let deps = collect_deps(file flen 0 total d0)
+    let m Manifest = Manifest(nm vr en deps)
+    ret m
+  }
+}
 
 pub load is {
   path buf -> ret buf {

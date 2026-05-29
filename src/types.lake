@@ -1,0 +1,43 @@
+// Core data model for house, on the modern stdlib (records + enums +
+// generics).  Replaces the old packed-buf / `:atom` / i64-kind-const
+// representation with proper nominal types:
+//
+//   * `Manifest` — a parsed `lake.house` file.
+//   * `Dep`      — one `dep "<name>" "<ver>" [path "<dir>"]` line.
+//   * `DepSource`— the source-shape classification (was the
+//                  `DEP_BARE / DEP_GIT / DEP_PATH` i64 consts).
+//
+// Note (compiler limitations in flight, see lake-native-compiler
+// docs/state/bugs/157 + 158): constructing these via `Dep(...)` and
+// reading enum / generic fields needs an explicitly-typed `let` at the
+// use site (`let d Dep = Dep(...)`, `let s DepSource = dep.src`).  The
+// annotations are kept deliberately throughout house until the
+// expected-type-inference fixes land.
+
++std.vec.{ Vec }
+
+// How a dependency is fetched.
+DepSource is enum {
+  Registry      // bare semver, resolved through the registry
+  Git           // "git+<url>#<ref>" — shallow clone
+  Path          // explicit `path "<dir>"` override, used verbatim
+}
+
+// One dependency entry.  `ver` holds the version string for a
+// Registry dep, the `git+url#ref` string for a Git dep, or the pinned
+// version for a Path dep (whose actual location is `ovr`).  `ovr` is an
+// empty buf unless `src` is `Path`.
+Dep is {
+  name buf
+  ver  buf
+  src  DepSource
+  ovr  buf
+}
+
+// A parsed `lake.house` manifest.  `deps` is empty for a leaf project.
+Manifest is {
+  name    buf
+  version buf
+  entry   buf
+  deps    Vec[Dep]
+}
